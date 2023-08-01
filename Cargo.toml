@@ -2,6 +2,8 @@
 name = "thin-jsonrpc-client"
 version = "0.0.1"
 edition = "2021"
+description = "A lightweight, runtime agnostic JSON-RPC client"
+license = "MIT"
 
 [dependencies]
 derive_more = { version = "0.99.17", default_features = false, features = ["from", "display"] }
