@@ -9,8 +9,20 @@ use std::collections::VecDeque;
 use crate::backend::{ BackendReceiver, BackendError };
 use crate::response::{ Response, ResponseError };
 
+/// An error returned by [`ResponseStreamMaster`] if something
+/// goes wrong attempting to receive/parse a message.
+#[derive(Debug, derive_more::From, derive_more::Display)]
+pub enum ResponseStreamError {
+    #[from]
+    BackendError(BackendError),
+    #[from]
+    Response(ResponseError)
+}
+
+impl std::error::Error for ResponseStreamError {}
+
 /// A single item emitted by a [`ResponseStream`].
-pub type ResponseStreamItem = Result<Arc<Response<'static>>, ResponseError>;
+pub type ResponseStreamItem = Arc<Response<'static>>;
 
 /// A stream of [`ResponseStreamItem`]s from the backend. This can be cloned, with
 /// different streams filtering out different messages.
@@ -18,16 +30,6 @@ pub struct ResponseStream {
     id: u64,
     queue: VecDeque<ResponseStreamItem>,
     inner: Arc<Mutex<ResponseStreamInner>>
-}
-
-impl ResponseStream {
-    /// Filter the [`ResponseStream`] based on the function provided. This
-    /// function is expected to be fast, and can block progression of other
-    /// streams if it is too slow. Prefer the combinators on [`futures::StreamExt`]
-    /// if you need to run slow or async logic.
-    pub fn with_filter(&self, filter_fn: FilterFn) -> ResponseStream {
-        create_response_stream(self.inner.clone(), filter_fn)
-    }
 }
 
 impl Stream for ResponseStream {
@@ -105,29 +107,21 @@ impl ResponseStreamMaster {
     pub fn handle(&self) -> ResponseStreamHandle {
         ResponseStreamHandle { inner: self.inner.clone() }
     }
-
-    /// Filter the [`ResponseStream`] based on the function provided. This
-    /// function is expected to be fast, and can block progression of other
-    /// streams if it is too slow. Prefer the combinators on [`futures::StreamExt`]
-    /// if you need to run slow or async logic.
-    pub fn with_filter(&self, filter_fn: FilterFn) -> ResponseStream {
-        create_response_stream(self.inner.clone(), filter_fn)
-    }
 }
 
-impl Future for ResponseStreamMaster {
-    type Output = BackendError;
+impl Stream for ResponseStreamMaster {
+    type Item = ResponseStreamError;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
-        // We never return from this future unless the backend gives
-        // us a Pending (so we know we'll wake again) or we get an error
-        // (so we return it and end).
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
+            // We never return from this future unless the backend gives
+            // us a Pending (so we know we'll wake again) or we get an error
+            // (so we return it and end).
             let this = &mut *self;
 
             if this.done {
                 // This has already finished.
-                return Poll::Pending;
+                return Poll::Ready(None);
             }
 
             // Get a future to receive the next item.
@@ -155,13 +149,21 @@ impl Future for ResponseStreamMaster {
                     this.done = true;
                     // Tell streams to stop:
                     this.inner.lock().unwrap().done = true;
-                    return Poll::Ready(err)
+                    return Poll::Ready(Some(err.into()))
                 },
                 Ok(msg_bytes) => msg_bytes
             };
 
-            // Deserialize the message, borrowing what we can.
-            let response = Response::from_bytes(&msg_bytes);
+            // Deserialize the message, borrowing what we can. An error here is recoverable
+            // and won't stop everything.
+            let response = match Response::from_bytes(&msg_bytes) {
+                Err(err) => {
+                    // This error can be ignored but will be handed back.
+                    // The calling code can call the future again to resume.
+                    return Poll::Ready(Some(err.into()))
+                },
+                Ok(r) => r,
+            };
 
             // At this point, we need to lock the shared state to find out
             // who to broadcast the message to.
@@ -179,9 +181,7 @@ impl Future for ResponseStreamMaster {
                 // the `Response` and put it in an Arc for cheaper broadcasting.
                 let response_item = match &cached_response_item {
                     None => {
-                        let response_item = response
-                            .clone()
-                            .map(|r| Arc::new(r.into_owned()));
+                        let response_item = Arc::new(response.clone().into_owned());
                         cached_response_item = Some(response_item.clone());
                         response_item
                     },
@@ -223,7 +223,8 @@ impl ResponseStreamHandle {
     }
 }
 
-type FilterFn = Box<dyn FnMut(&Result<Response<'_>, ResponseError>) -> bool + Send + 'static>;
+/// The type of function used to filter the notification stream.
+pub type FilterFn = Box<dyn FnMut(&Response<'_>) -> bool + Send + 'static>;
 
 struct ResponseStreamInner {
     // Don't poll any more; we hit an error so we're done.

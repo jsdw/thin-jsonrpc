@@ -27,6 +27,7 @@ pub type RpcParams = Option<Box<RawValue>>;
 ///
 /// // Use RPC parameters...
 /// ```
+#[derive(Clone, Debug)]
 pub struct ObjectParams {
     bytes: Vec<u8>
 }
@@ -86,6 +87,7 @@ impl IntoRpcParams for ObjectParams {
 ///
 /// // Use RPC parameters...
 /// ```
+#[derive(Clone, Debug)]
 pub struct ArrayParams {
     bytes: Vec<u8>
 }

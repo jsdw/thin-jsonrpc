@@ -8,41 +8,28 @@ pub mod response;
 /// A broadcast-style stream of decoded JSON-RPC responses.
 mod response_stream;
 
-use futures::Future;
+use futures::{Stream, StreamExt};
 use response_stream::{ResponseStream, ResponseStreamMaster, ResponseStreamHandle};
+use response::{Response};
 use backend::{BackendSender, BackendReceiver};
 use serde::de::DeserializeOwned;
 use params::IntoRpcParams;
 use std::sync::atomic::{ AtomicU64, Ordering };
 use std::sync::Arc;
 
-use crate::response::Response;
-
-/// An error indicating that something went wrong trying to
-/// send or receive messages.
-#[derive(derive_more::From, derive_more::Display, Clone)]
-pub enum Error {
+/// An error handed back from [`Client::request()`].
+#[derive(Debug, derive_more::From, derive_more::Display)]
+pub enum RequestError {
     #[from]
     Backend(backend::BackendError),
-    #[from]
-    Response(response::ResponseError),
-    #[display(fmt = "The connection has been closed")]
-    ConnectionClosed
-}
-
-/// An error handed back from [`Client::request()`]. This can be
-/// the error object handed back in the valid RPC response, or some
-/// error deserializing the response to the requested type, or any
-/// other [`Error`].
-#[derive(derive_more::From, derive_more::Display)]
-pub enum RequestError {
     #[from]
     Rpc(response::ErrorObject<'static>),
     #[from]
     Deserialize(serde_json::Error),
-    #[from]
-    Other(Error)
+    ConnectionClosed,
 }
+
+impl std::error::Error for RequestError {}
 
 pub struct Client {
     next_id: AtomicU64,
@@ -52,6 +39,8 @@ pub struct Client {
 
 impl Client {
     /// Construct a client/driver from a [`BackendSender`] and [`BackendReceiver`].
+    /// The [`ClientDriver`] handed back is a stream which needs polling in order to
+    /// drive the message receiving.
     pub fn from_backend<S, R>(send: S, recv: R) -> (Client, ClientDriver)
     where
         S: BackendSender,
@@ -88,36 +77,26 @@ impl Client {
 
         // Subscribe to responses with the matching ID.
         let mut response_stream = self.stream.with_filter(Box::new(move |res| {
-            let Ok(msg) = res else {
+            let Some(msg_id) = res.id() else {
                 return false
             };
 
-            let msg_id = match msg {
-                Response::Err(err) => &err.id,
-                Response::Ok(ok) => &ok.id
-            };
-
-            let Some(msg_id) = msg_id else {
-                return false
-            };
-
-            id == &**msg_id
+            id == msg_id
         }));
 
         // Now we're set up to wait for the reply, send the message.
         self.sender
             .send(request.as_bytes())
             .await
-            .map_err(|e| RequestError::Other(e.into()))?;
+            .map_err(|e| RequestError::Backend(e))?;
 
         // Get the response.
-        use futures::stream::StreamExt;
         let response = response_stream.next().await;
 
         match response {
             // Some message came back. if it's a response, deserialize it. If it's an error,
             // just return the error.
-            Some(Ok(msg)) => {
+            Some(msg) => {
                 match &*msg {
                     Response::Ok(msg) => {
                         serde_json::from_str(msg.result.get()).map_err(|e| e.into())
@@ -127,20 +106,15 @@ impl Client {
                     }
                 }
             },
-            // Report back any "show stopper" errors as-is.
-            Some(Err(e)) => {
-                Err(RequestError::Other(e.into()))
-            },
-            // None means that the stream is finished; connection closed. We'll have received
-            // an error before this happens.
+            // None means that the stream is finished; connection closed.
             None => {
-                Err(RequestError::Other(Error::ConnectionClosed))
+                Err(RequestError::ConnectionClosed)
             }
         }
     }
 
     /// Send a notification to the RPC server. This will not return a result.
-    pub async fn notification(&self, call: Call<'_>) -> Result<(), Error> {
+    pub async fn notification(&self, call: Call<'_>) -> Result<(), backend::BackendError> {
         let call_name = call.name;
         let params = call.params;
 
@@ -158,26 +132,30 @@ impl Client {
 
     /// Obtain a stream of incoming notifications from the backend that aren't linked to
     /// any specific request.
-    pub fn server_notifications(&self) -> ServerNotifications {
+    pub fn incoming(&self) -> ServerNotifications {
         todo!()
     }
 }
 
-/// This must be polled/`.await`-ed in order to accept messages from the server.
+/// This must be polled in order to accept messages from the server.
 /// Nothing will happen unless it is. This design allows us to apply backpressure
 /// (by polling this less often), and allows us to drive multiple notification streams
 /// without requiring any specific async runtime.
 pub struct ClientDriver(ResponseStreamMaster);
 
-impl Future for ClientDriver {
-    type Output = <ResponseStreamMaster as Future>::Output;
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-        use futures::FutureExt;
-        self.0.poll_unpin(cx)
+/// An error driving the message receiving. If the stream subsequently
+/// returns [`None`], it was due to the last emitted error.
+pub type ClientDriverError = response_stream::ResponseStreamError;
+
+impl Stream for ClientDriver {
+    type Item = ClientDriverError;
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_next_unpin(cx)
     }
 }
 
 /// Construct an RPC call. This can be used with [`Client::request()`] or [`Client::notification`].
+#[derive(Debug, Clone)]
 pub struct Call<'a> {
     name: &'a str,
     params: params::RpcParams
@@ -192,6 +170,49 @@ impl <'a> Call<'a> {
     }
 }
 
+/// A struct representing messages from the server.
+pub struct ServerNotifications(ResponseStreamHandle);
 
-pub struct ServerNotifications(ResponseStream);
+impl ServerNotifications {
+    /// Return all valid notifications.
+    pub fn all(&self) -> ServerNotificationStream {
+        let f: response_stream::FilterFn = Box::new(move |res| {
+            // Always Ignore responses to requests:
+            res.id().is_none()
+        });
 
+        ServerNotificationStream(self.0.with_filter(f))
+    }
+
+    /// Filter the incoming stream of notifications and only return
+    /// matching messages. The filter is applied early on and can
+    /// save allocations in the case that nothing is interested in a
+    /// particular message.
+    pub fn with_filter<F>(&self, mut filter_fn: F) -> ServerNotificationStream
+    where
+        F: FnMut(&Response<'_>) -> bool + Send + 'static
+    {
+        let f: response_stream::FilterFn = Box::new(move |res| {
+            // Always Ignore responses to requests:
+            if res.id().is_some() {
+                return false
+            }
+
+            // Apply user filter:
+            filter_fn(res)
+        });
+
+        ServerNotificationStream(self.0.with_filter(f))
+    }
+}
+
+/// A stream of server notifications.
+pub struct ServerNotificationStream(ResponseStream);
+
+impl Stream for ServerNotificationStream {
+    type Item = Arc<Response<'static>>;
+
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.0.poll_next_unpin(cx)
+    }
+}

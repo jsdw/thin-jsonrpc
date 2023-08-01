@@ -10,7 +10,7 @@ pub trait BackendSender: Send + Sync + 'static {
 
 pub trait BackendReceiver {
     /// Hand back the next message each time it's called. If this emits a [`BackendError`], we'll
-    /// stop asking for messages. The btyes given back should deserialize to a valid JSON-RPC object.
+    /// stop asking for messages. The bytes given back should deserialize to a valid JSON-RPC object.
     fn receive(&self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, BackendError>>>>;
 }
 

@@ -1,14 +1,15 @@
 use serde_json::value::RawValue;
 use std::borrow::Cow;
-use std::sync::Arc;
 
-#[derive(derive_more::From, derive_more::Display, Clone)]
+#[derive(Debug, derive_more::From, derive_more::Display)]
 pub enum ResponseError {
+    /// There was an error deserializing the response.
     #[from]
-    #[display(fmt = "{_0}")]
-    Deserialize(Arc<serde_json::Error>),
+    #[display(fmt = "{error}")]
+    Deserialize { error: serde_json::Error, bytes: Vec<u8> },
+    /// The "jsonrpc" field did not equal "2.0".
     #[display(fmt = "failed to decode response: expected '\"jsonrpc\": \"2.0\"'")]
-    InvalidVersion
+    InvalidVersion { bytes: Vec<u8> }
 }
 
 /// A JSON-RPC response is either a "result" or "error" payload.
@@ -20,6 +21,16 @@ pub enum Response<'a> {
 }
 
 impl <'a> Response<'a> {
+    /// Return the ID associated with the response, if there is one.
+    /// Notifications from the server that aren't associated with a
+    /// request won't.
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            Response::Ok(r) => r.id.as_deref(),
+            Response::Err(e) => e.id.as_deref()
+        }
+    }
+
     /// Decode some bytes into a valid JSON-RPC response or
     /// return an error if it's not valid.
     pub fn from_bytes(bytes: &[u8]) -> Result<Response<'_>, ResponseError> {
@@ -27,7 +38,7 @@ impl <'a> Response<'a> {
             Ok(res) => res,
             Err(_) => serde_json::from_slice(bytes)
                 .map(|res| Response::Err(res))
-                .map_err(|e| Arc::new(e))?
+                .map_err(|e| ResponseError::Deserialize { error: e, bytes: bytes.to_owned() })?
         };
 
         let version = match &res {
@@ -36,7 +47,7 @@ impl <'a> Response<'a> {
         };
 
         if version != "2.0" {
-            return Err(ResponseError::InvalidVersion)
+            return Err(ResponseError::InvalidVersion { bytes: bytes.to_owned() })
         }
 
         Ok(res)
