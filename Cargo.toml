@@ -1,0 +1,10 @@
+[package]
+name = "thin-jsonrpc-client"
+version = "0.0.1"
+edition = "2021"
+
+[dependencies]
+derive_more = { version = "0.99.17", default_features = false, features = ["from", "display"] }
+futures = "0.3.28"
+serde = { version = "1.0.175", features = ["derive"] }
+serde_json = { version = "1.0.103", features = ["raw_value"] }
