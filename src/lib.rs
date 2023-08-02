@@ -133,7 +133,7 @@ impl Client {
     /// Obtain a stream of incoming notifications from the backend that aren't linked to
     /// any specific request.
     pub fn incoming(&self) -> ServerNotifications {
-        todo!()
+        ServerNotifications(self.stream.clone())
     }
 }
 
