@@ -76,7 +76,7 @@ impl Client {
         };
 
         // Subscribe to responses with the matching ID.
-        let mut response_stream = self.stream.with_filter(Box::new(move |res| {
+        let mut response_stream = self.stream.with_filter(Arc::new(move |res| {
             let Some(msg_id) = res.id() else {
                 return false
             };
@@ -130,9 +130,9 @@ impl Client {
         Ok(())
     }
 
-    /// Obtain a stream of incoming notifications from the backend that aren't linked to
+    /// Obtain a stream of server notifications from the backend that aren't linked to
     /// any specific request.
-    pub fn incoming(&self) -> ServerNotifications {
+    pub fn server_notifications(&self) -> ServerNotifications {
         ServerNotifications(self.stream.clone())
     }
 }
@@ -174,9 +174,17 @@ impl <'a> Call<'a> {
 pub struct ServerNotifications(ResponseStreamHandle);
 
 impl ServerNotifications {
+    /// Return any notifications not being handed to any other stream.
+    /// This is useful for debugging and diagnostic purposes, because
+    /// it's likely that every incoming message is expected to be handled
+    /// by something. It's the equivalent of a "404" location.
+    pub fn leftovers(&self) -> ServerNotificationStream {
+        ServerNotificationStream(self.0.leftovers())
+    }
+
     /// Return all valid notifications.
     pub fn all(&self) -> ServerNotificationStream {
-        let f: response_stream::FilterFn = Box::new(move |res| {
+        let f: response_stream::FilterFn = Arc::new(move |res| {
             // Always Ignore responses to requests:
             res.id().is_none()
         });
@@ -188,11 +196,11 @@ impl ServerNotifications {
     /// matching messages. The filter is applied early on and can
     /// save allocations in the case that nothing is interested in a
     /// particular message.
-    pub fn with_filter<F>(&self, mut filter_fn: F) -> ServerNotificationStream
+    pub fn with_filter<F>(&self, filter_fn: F) -> ServerNotificationStream
     where
-        F: FnMut(&Response<'_>) -> bool + Send + 'static
+        F: Fn(&Response<'_>) -> bool + Send + 'static
     {
-        let f: response_stream::FilterFn = Box::new(move |res| {
+        let f: response_stream::FilterFn = Arc::new(move |res| {
             // Always Ignore responses to requests:
             if res.id().is_some() {
                 return false

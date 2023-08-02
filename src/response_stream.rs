@@ -29,7 +29,8 @@ pub type ResponseStreamItem = Arc<Response<'static>>;
 pub struct ResponseStream {
     id: u64,
     queue: VecDeque<ResponseStreamItem>,
-    inner: Arc<Mutex<ResponseStreamInner>>
+    inner: Arc<Mutex<ResponseStreamInner>>,
+    is_for_leftovers: bool
 }
 
 impl Stream for ResponseStream {
@@ -47,9 +48,13 @@ impl Stream for ResponseStream {
         let mut inner = this.inner.lock().unwrap();
         let inner = &mut *inner;
 
+        let instance = match this.is_for_leftovers {
+            true => inner.leftover_instances.get_mut(&this.id).expect("instance should exist"),
+            false => inner.instances.get_mut(&this.id).expect("instance should exist"),
+        };
+
         // Next, if there are items in the shared queue then put those into
         // our local queue and return from them.
-        let instance = inner.instances.get_mut(&this.id).expect("instance should exist");
         if !instance.queue.is_empty() {
             std::mem::swap(&mut instance.queue, &mut this.queue);
             return Poll::Ready(Some(this.queue.pop_front().expect("queue shouldn't be empty")));
@@ -66,11 +71,54 @@ impl Stream for ResponseStream {
     }
 }
 
+impl Clone for ResponseStream {
+    // Cloning a stream creates a new stream which will receive
+    // identical messages to the original.
+    fn clone(&self) -> Self {
+        let mut inner = self.inner.lock().expect("can obtain lock");
+
+        let old_instance = match self.is_for_leftovers {
+            true => inner.leftover_instances.get(&self.id)
+                .expect("leftover instance should exist"),
+            false => inner.instances.get(&self.id)
+                .expect("instance should exist")
+        };
+
+        let new_instance = Instance {
+            filter_fn: old_instance.filter_fn.clone(),
+            waker: None,
+            queue: old_instance.queue.clone()
+        };
+
+        let new_id = inner.next_id;
+
+        if self.is_for_leftovers {
+            inner.leftover_instances.insert(new_id, new_instance);
+        } else {
+            inner.instances.insert(new_id, new_instance);
+        }
+
+        inner.next_id += 1;
+        drop(inner);
+
+        Self {
+            id: new_id,
+            queue: self.queue.clone(),
+            inner: self.inner.clone(),
+            is_for_leftovers: self.is_for_leftovers,
+        }
+    }
+}
+
 impl Drop for ResponseStream {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
             // De-register this instance:
-            inner.instances.remove(&self.id);
+            if self.is_for_leftovers {
+                inner.leftover_instances.remove(&self.id);
+            } else {
+                inner.instances.remove(&self.id);
+            }
         }
     }
 }
@@ -97,7 +145,8 @@ impl ResponseStreamMaster {
             inner: Arc::new(Mutex::new(ResponseStreamInner {
                 done: false,
                 next_id: 1,
-                instances: HashMap::new()
+                instances: HashMap::new(),
+                leftover_instances: HashMap::new(),
             }))
         }
     }
@@ -172,9 +221,12 @@ impl Stream for ResponseStreamMaster {
 
             let mut cached_response_item = None;
             for instance in inner.instances.values_mut() {
-                // This instance doesn't care; continue.
-                if !(instance.filter_fn)(&response) {
-                    continue
+                // This instance doesn't care; continue. No filter fn means
+                // it will accept anything.
+                if let Some(filter_fn) = &mut instance.filter_fn {
+                    if !filter_fn(&response) {
+                        continue
+                    }
                 }
 
                 // Clone cached item if it's there (it's an Arc), or take ownership of
@@ -192,6 +244,17 @@ impl Stream for ResponseStreamMaster {
                 instance.queue.push_back(response_item);
                 if let Some(waker) = instance.waker.take() {
                     waker.wake();
+                }
+            }
+
+            // Nothing accepted the message; send it to any "leftover" instances we have.
+            if cached_response_item.is_none() && !inner.leftover_instances.is_empty() {
+                let response_item = Arc::new(response.into_owned());
+                for leftover_instance in inner.leftover_instances.values_mut() {
+                    leftover_instance.queue.push_back(response_item.clone());
+                    if let Some(waker) = leftover_instance.waker.take() {
+                        waker.wake();
+                    }
                 }
             }
         }
@@ -214,17 +277,24 @@ pub struct ResponseStreamHandle {
 }
 
 impl ResponseStreamHandle {
+    /// Return any messages that no other stream wants. This can be useful
+    /// for diagnostics and debugging, since ordinarily we'd expect to be handling
+    /// any messages that are sent our way.
+    pub fn leftovers(&self) -> ResponseStream {
+        create_response_stream(self.inner.clone(), None, true)
+    }
+
     /// Filter the [`ResponseStream`] based on the function provided. This
     /// function is expected to be fast, and can block progression of other
     /// streams if it is too slow. Prefer the combinators on [`futures::StreamExt`]
     /// if you need to run slow or async logic.
     pub fn with_filter(&self, filter_fn: FilterFn) -> ResponseStream {
-        create_response_stream(self.inner.clone(), filter_fn)
+        create_response_stream(self.inner.clone(), Some(filter_fn), false)
     }
 }
 
 /// The type of function used to filter the notification stream.
-pub type FilterFn = Box<dyn FnMut(&Response<'_>) -> bool + Send + 'static>;
+pub type FilterFn = Arc<dyn Fn(&Response<'_>) -> bool + Send + 'static>;
 
 struct ResponseStreamInner {
     // Don't poll any more; we hit an error so we're done.
@@ -233,32 +303,47 @@ struct ResponseStreamInner {
     next_id: u64,
     // Track instance details.
     instances: HashMap<u64, Instance>,
+    // Things registered to receive "leftovers" not consumed by anything else
+    leftover_instances: HashMap<u64, Instance>
 }
 
 /// Create a [`ResponseStream`] given the shared `inner` content.
-fn create_response_stream(inner: Arc<Mutex<ResponseStreamInner>>, filter_fn: FilterFn) -> ResponseStream {
+fn create_response_stream(
+    inner: Arc<Mutex<ResponseStreamInner>>,
+    filter_fn: Option<FilterFn>,
+    is_for_leftovers: bool
+) -> ResponseStream {
     let mut guard = inner.lock().unwrap();
     let id = guard.next_id;
 
     // "register" this copy of the stream to receive messages.
     guard.next_id += 1;
-    guard.instances.insert(id, Instance {
+
+    let instance = Instance {
         filter_fn,
         queue: VecDeque::new(),
         waker: None
-    });
+    };
+
+    if is_for_leftovers {
+        guard.leftover_instances.insert(id, instance);
+    } else {
+        guard.instances.insert(id, instance);
+    }
 
     drop(guard);
 
     ResponseStream {
         id,
         queue: VecDeque::new(),
-        inner
+        inner,
+        is_for_leftovers
     }
 }
 
+/// This represents a single response stream.
 struct Instance {
     waker: Option<Waker>,
-    filter_fn: FilterFn,
+    filter_fn: Option<FilterFn>,
     queue: VecDeque<ResponseStreamItem>
 }
