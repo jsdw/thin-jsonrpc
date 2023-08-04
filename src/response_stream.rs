@@ -1,5 +1,5 @@
-use futures::FutureExt;
-use futures::stream::Stream;
+use futures_util::FutureExt;
+use futures_core::stream::Stream;
 use std::sync::{ Mutex, Arc };
 use std::collections::HashMap;
 use std::task::{ Poll, Waker };

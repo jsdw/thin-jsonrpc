@@ -10,6 +10,7 @@ pub trait IntoRpcParams {
     fn into_rpc_params(self) -> RpcParams;
 }
 
+/// The RPC params we'll return from our implementations of [`IntoRpcParams`].
 pub type RpcParams = Option<Box<RawValue>>;
 
 /// Parameter builder to build valid "object or "named" parameters.

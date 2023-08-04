@@ -1,22 +1,34 @@
 use serde_json::value::RawValue;
 use std::borrow::Cow;
 
+/// An error handed back when we cannot correctly deserialize
+/// bytes into our [`Response`] object.
 #[derive(Debug, derive_more::From, derive_more::Display)]
 pub enum ResponseError {
     /// There was an error deserializing the response.
     #[from]
     #[display(fmt = "{error}")]
-    Deserialize { error: serde_json::Error, bytes: Vec<u8> },
+    Deserialize {
+        /// The underlying serde error.
+        error: serde_json::Error,
+        /// The raw bytes that we failed to deserialize.
+        bytes: Vec<u8>
+    },
     /// The "jsonrpc" field did not equal "2.0".
     #[display(fmt = "failed to decode response: expected '\"jsonrpc\": \"2.0\"'")]
-    InvalidVersion { bytes: Vec<u8> }
+    InvalidVersion {
+        /// The raw bytes that we failed to deserialize.
+        bytes: Vec<u8>
+    }
 }
 
 /// A JSON-RPC response is either a "result" or "error" payload.
 /// This represents the shape a message can deserialize into.
 #[derive(Clone, Debug)]
 pub enum Response<'a> {
+    /// A JSON-RPC "result" response.
     Ok(OkResponse<'a>),
+    /// A JSON-RPC "error" response.
     Err(ErrorResponse<'a>)
 }
 
@@ -66,12 +78,15 @@ impl <'a> Response<'a> {
     }
 }
 
+/// A JSON-RPC "result" response.
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct OkResponse<'a> {
     #[serde(borrow)]
     jsonrpc: Cow<'a, str>,
+    /// The message ID. None if this is a server notification.
     #[serde(borrow)]
     pub id: Option<Cow<'a, str>>,
+    /// The result body.
     #[serde(borrow)]
     pub result: Cow<'a, RawValue>
 }
@@ -87,12 +102,15 @@ impl <'a> OkResponse<'a> {
     }
 }
 
+/// A JSON-RPC "error" response.
 #[derive(serde::Deserialize, Clone, Debug)]
 pub struct ErrorResponse<'a> {
     #[serde(borrow)]
     jsonrpc: Cow<'a, str>,
+    /// The message ID. None if this is a server notification.
     #[serde(borrow)]
     pub id: Option<Cow<'a, str>>,
+    /// Error details.
     #[serde(borrow)]
     pub error: ErrorObject<'a>
 }
@@ -108,12 +126,16 @@ impl <'a> ErrorResponse<'a> {
     }
 }
 
+/// Details about the JSON-RPC error response.
 #[derive(serde::Deserialize, derive_more::Display, Clone, Debug)]
 #[display(fmt = "Error {code}: {message}")]
 pub struct ErrorObject<'a> {
+    /// An error code.
     pub code: i32,
+    /// A "pretty" error message.
     #[serde(borrow)]
     pub message: Cow<'a, str>,
+    /// Some other optional error context.
     #[serde(borrow)]
     pub data: Option<Cow<'a, RawValue>>
 }
