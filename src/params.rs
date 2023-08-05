@@ -26,11 +26,11 @@ impl IntoRpcParams for RpcParams {
 ///
 /// ```rust
 ///
-/// use jsonrpc_client::params::ObjectParams;
+/// use thin_jsonrpc_client::params::ObjectParams;
 ///
-/// let mut builder = ObjectParams::new();
-/// builder.insert("param1", 1);
-/// builder.insert("param2", "abc");
+/// let params = ObjectParams::new()
+///     .insert("param1", 1)
+///     .insert("param2", "abc");
 ///
 /// // Use RPC parameters...
 /// ```
@@ -83,11 +83,11 @@ impl IntoRpcParams for ObjectParams {
 ///
 /// ```rust
 ///
-/// use jsonrpc_client::params::ArrayParams;
+/// use thin_jsonrpc_client::params::ArrayParams;
 ///
-/// let mut builder = ArrayParams::new();
-/// builder.insert("param1");
-/// builder.insert(1);
+/// let params = ArrayParams::new()
+///     .insert("param1")
+///     .insert(1);
 ///
 /// // Use RPC parameters...
 /// ```

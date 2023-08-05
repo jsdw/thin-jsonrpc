@@ -163,8 +163,7 @@ impl Client {
 ///   delivered just prior to this, or because the [`Client`] was dropped.
 pub struct ClientDriver(ResponseStreamMaster);
 
-/// An error driving the message receiving. If the stream subsequently
-/// returns [`None`], it was due to the last emitted error.
+/// An error was encountered while receiving messages from the backend.
 pub type ClientDriverError = response_stream::ResponseStreamError;
 
 impl Stream for ClientDriver {
@@ -206,7 +205,7 @@ impl ServerNotifications {
 
     /// Filter the incoming stream of notifications and only return
     /// matching messages. Only "ok" responses are filtered,
-    pub fn ok_filtered<F>(&self, filter_fn: F) -> ServerNotificationStream
+    pub fn filtered_oks<F>(&self, filter_fn: F) -> ServerNotificationStream
     where
         F: Fn(&raw_response::OkResponse<'_>) -> bool + Send + Sync + 'static
     {
@@ -229,7 +228,7 @@ impl ServerNotifications {
     /// matching messages that can be properly deserialized into the target
     /// type. This deserializing should aim to be fast, since the filter will
     /// run against almost every incoming message.
-    pub fn ok_filtered_as<R, F>(&self, filter_fn: F) -> ServerNotificationStream
+    pub fn filtered_oks_as<R, F>(&self, filter_fn: F) -> ServerNotificationStream
     where
         R: for<'de> serde::de::Deserialize<'de>,
         F: Fn(R) -> bool + Send + Sync + 'static
@@ -258,7 +257,7 @@ impl ServerNotifications {
 
     /// Filter the incoming stream of notifications and only return
     /// matching messages. Only "ok" responses are filtered,
-    pub fn err_filtered<F>(&self, filter_fn: F) -> ServerNotificationStream
+    pub fn filtered_errors<F>(&self, filter_fn: F) -> ServerNotificationStream
     where
         F: Fn(&raw_response::ErrorResponse<'_>) -> bool + Send + Sync + 'static
     {
@@ -380,15 +379,18 @@ mod test {
                 for i in 0u64..20 {
                     cx.send_ok_response::<u8,_>(None, i);
                 }
+                // If we don't shutdown after, the streams will wait
+                // forever for new messages:
                 cx.shutdown();
             });
 
         // Subscribe to messages:
-        let twos = client.server_notifications().ok_filtered_as(|res: u64| res % 2 == 0);
+        let twos = client.server_notifications().filtered_oks_as(|res: u64| res % 2 == 0);
         let twos_2 = twos.clone();
-        let threes = client.server_notifications().ok_filtered_as(|res: u64| res % 3 == 0);
-        let bools = client.server_notifications().ok_filtered_as(|_: bool| true);
+        let threes = client.server_notifications().filtered_oks_as(|res: u64| res % 3 == 0);
+        let bools = client.server_notifications().filtered_oks_as(|_: bool| true);
         let rest = client.server_notifications().leftovers();
+        let rest_2 = client.server_notifications().leftovers();
 
         // Start sending notifications.
         client.notification("start_sending", ()).await?;
@@ -399,10 +401,11 @@ mod test {
         let into_u64 = |res: Response| async move { res.ok_into::<u64>().ok() };
 
         // Collect them in our streams to check:
+        let rest: Vec<u64> = rest.filter_map(into_u64).collect().await;
+        let rest_2: Vec<u64> = rest_2.filter_map(into_u64).collect().await;
         let twos: Vec<u64> = twos.filter_map(into_u64).collect().await;
         let twos_2: Vec<u64> = twos_2.filter_map(into_u64).collect().await;
         let threes: Vec<u64> = threes.filter_map(into_u64).collect().await;
-        let rest: Vec<u64> = rest.filter_map(into_u64).collect().await;
         let bools: Vec<_> = bools.collect().await;
 
         let expected_twos = vec![0,2,4,6,8,10,12,14,16,18];
@@ -413,6 +416,7 @@ mod test {
         assert_eq!(twos_2, expected_twos);
         assert_eq!(threes, expected_threes);
         assert_eq!(rest, expected_rest);
+        assert_eq!(rest_2, expected_rest);
         assert!(bools.is_empty());
 
         Ok(())
