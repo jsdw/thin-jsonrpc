@@ -65,7 +65,12 @@ pub mod mock {
         pub jsonrpc: String,
         pub id: Option<String>,
         pub method: String,
+        #[serde(default = "empty_raw_value")]
         pub params: Box<serde_json::value::RawValue>
+    }
+
+    fn empty_raw_value() -> Box<serde_json::value::RawValue> {
+        serde_json::value::RawValue::from_string("null".to_owned()).unwrap()
     }
 
     #[derive(Default)]
@@ -100,13 +105,17 @@ pub mod mock {
         /// Send raw bytes to be received by the [`BackendReceiver`].
         pub fn send_bytes(&self, bytes: Vec<u8>) {
             let mut inner = self.inner.lock().unwrap();
+            if inner.stopped {
+                return
+            }
             inner.send_queue.push_back(bytes);
             if let Some(waker) = inner.send_waker.take() {
                 waker.wake();
             }
         }
 
-        /// Shut the backend down.
+        /// Shut the backend down. It'll return None when asked for
+        /// messages as soon as any existing queue has been drained.
         pub fn shutdown(&self) {
             let mut inner = self.inner.lock().unwrap();
             inner.stopped = true;
@@ -125,6 +134,7 @@ pub mod mock {
     impl BackendSender for MockBackendSender {
         fn send(&mut self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'static>> {
             let Ok(req) = serde_json::from_slice::<MockRequest>(data) else {
+                eprintln!("Error decoding: {}", std::str::from_utf8(data).unwrap());
                 return Box::pin(std::future::ready(Ok(())))
             };
 
@@ -163,10 +173,10 @@ pub mod mock {
             let inner = self.inner.clone();
             Box::pin(std::future::poll_fn(move |cx| {
                 let mut inner = inner.lock().unwrap();
-                if inner.stopped {
-                    Poll::Ready(None)
-                } else if let Some(item) = inner.send_queue.pop_front() {
+                if let Some(item) = inner.send_queue.pop_front() {
                     Poll::Ready(Some(Ok(item)))
+                } else if inner.stopped {
+                    Poll::Ready(None)
                 } else {
                     inner.send_waker = Some(cx.waker().clone());
                     Poll::Pending

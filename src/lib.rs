@@ -175,32 +175,19 @@ impl Stream for ClientDriver {
 }
 
 /// A struct representing messages from the server.
+#[derive(Clone)]
 pub struct ServerNotifications(ResponseStreamHandle);
 
 impl ServerNotifications {
-    /// Return any notifications not being handed to any other stream.
-    /// This is useful for debugging and diagnostic purposes, because
-    /// it's likely that every incoming message is expected to be handled
-    /// by something. It's the equivalent of a "404" location.
+    /// Return any notifications not being handed to any non "leftovers" stream.
+    /// This is the equivalent of the "404" route for unwanted notifications.
     pub fn leftovers(&self) -> ServerNotificationStream {
         ServerNotificationStream::new(self.0.leftovers())
     }
 
-    /// Return all valid notifications.
-    pub fn all(&self) -> ServerNotificationStream {
-        let f: response_stream::FilterFn = Arc::new(move |res| {
-            // Always Ignore responses to requests:
-            res.id().is_none()
-        });
-
-        ServerNotificationStream::new(self.0.with_filter(f))
-    }
-
     /// Filter the incoming stream of notifications and only return
-    /// matching messages. The filter is applied early on and can
-    /// save allocations in the case that nothing is interested in a
-    /// particular message.
-    pub fn with_filter<F>(&self, filter_fn: F) -> ServerNotificationStream
+    /// matching messages. Messages can be "ok" or "error" types.
+    pub fn filtered<F>(&self, filter_fn: F) -> ServerNotificationStream
     where
         F: Fn(&RawResponse<'_>) -> bool + Send + Sync + 'static
     {
@@ -216,9 +203,85 @@ impl ServerNotifications {
 
         ServerNotificationStream::new(self.0.with_filter(f))
     }
+
+    /// Filter the incoming stream of notifications and only return
+    /// matching messages. Only "ok" responses are filtered,
+    pub fn ok_filtered<F>(&self, filter_fn: F) -> ServerNotificationStream
+    where
+        F: Fn(&raw_response::OkResponse<'_>) -> bool + Send + Sync + 'static
+    {
+        let f: response_stream::FilterFn = Arc::new(move |res| {
+            // Always Ignore responses to requests:
+            if res.id().is_some() {
+                return false
+            }
+
+            match res {
+                RawResponse::Ok(r) => filter_fn(r),
+                RawResponse::Error(_) => false
+            }
+        });
+
+        ServerNotificationStream::new(self.0.with_filter(f))
+    }
+
+    /// Filter the incoming stream of notifications and only return
+    /// matching messages that can be properly deserialized into the target
+    /// type. This deserializing should aim to be fast, since the filter will
+    /// run against almost every incoming message.
+    pub fn ok_filtered_as<R, F>(&self, filter_fn: F) -> ServerNotificationStream
+    where
+        R: for<'de> serde::de::Deserialize<'de>,
+        F: Fn(R) -> bool + Send + Sync + 'static
+    {
+        let f: response_stream::FilterFn = Arc::new(move |res| {
+            // Always Ignore responses to requests:
+            if res.id().is_some() {
+                return false
+            }
+
+            let RawResponse::Ok(res) = res else {
+                return false
+            };
+
+            // Deserialize message result:
+            let s = res.result.get();
+            let Ok(r) = serde_json::from_str(s) else {
+                return false
+            };
+
+            filter_fn(r)
+        });
+
+        ServerNotificationStream::new(self.0.with_filter(f))
+    }
+
+    /// Filter the incoming stream of notifications and only return
+    /// matching messages. Only "ok" responses are filtered,
+    pub fn err_filtered<F>(&self, filter_fn: F) -> ServerNotificationStream
+    where
+        F: Fn(&raw_response::ErrorResponse<'_>) -> bool + Send + Sync + 'static
+    {
+        let f: response_stream::FilterFn = Arc::new(move |res| {
+            // Always Ignore responses to requests:
+            if res.id().is_some() {
+                return false
+            }
+
+            match res {
+                RawResponse::Ok(_) => false,
+                RawResponse::Error(err) => filter_fn(err)
+            }
+        });
+
+        ServerNotificationStream::new(self.0.with_filter(f))
+    }
 }
 
-/// A stream of server notifications.
+/// A stream of server notifications. This implements [`futures_core::Stream`].
+/// The easiest way to work with it is to pull in [`futures_util::StreamExt`],
+/// which provides a bunch of nice helper methods on streams.
+#[derive(Clone)]
 pub struct ServerNotificationStream {
     stream: ResponseStream
 }
@@ -249,10 +312,13 @@ mod test {
 
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
-    fn mock_client() -> (Client, MockBackend) {
+    fn mock_client() -> (Client, ClientDriver, MockBackend) {
         let (mock_backend, mock_send, mock_recv) = mock::build();
-        let (client, mut driver) = Client::from_backend(mock_send, mock_recv);
-        // Drive the receipt of messages until a shutdown happens.
+        let (client, driver) = Client::from_backend(mock_send, mock_recv);
+        (client, driver, mock_backend)
+    }
+
+    fn drive_client(mut driver: ClientDriver) {
         tokio::spawn(async move {
             while let Some(res) = driver.next().await {
                 if let Err(err) = res {
@@ -260,12 +326,12 @@ mod test {
                 }
             }
         });
-        (client, mock_backend)
     }
 
     #[tokio::test]
     async fn test_basic_requests() -> Result<(), Error> {
-        let (mut client, backend) = mock_client();
+        let (mut client, driver, backend) = mock_client();
+        drive_client(driver);
 
         backend
             .handler("echo_ok_raw", |cx, req| {
@@ -300,6 +366,54 @@ mod test {
             let res: i64 = client.request("add", (i, 1)).await?.ok_into()?;
             assert_eq!(res, i + 1);
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_notifications() -> Result<(), Error> {
+        let (mut client, driver, backend) = mock_client();
+        drive_client(driver);
+
+        backend
+            .handler("start_sending", |cx, _req| {
+                for i in 0u64..20 {
+                    cx.send_ok_response::<u8,_>(None, i);
+                }
+                cx.shutdown();
+            });
+
+        // Subscribe to messages:
+        let twos = client.server_notifications().ok_filtered_as(|res: u64| res % 2 == 0);
+        let twos_2 = twos.clone();
+        let threes = client.server_notifications().ok_filtered_as(|res: u64| res % 3 == 0);
+        let bools = client.server_notifications().ok_filtered_as(|_: bool| true);
+        let rest = client.server_notifications().leftovers();
+
+        // Start sending notifications.
+        client.notification("start_sending", ()).await?;
+
+        // Even though we deserialized to filter, we still need to deserialize the
+        // actual notifications later. (The filter should aim to deserialize as
+        // little as possible to filter).
+        let into_u64 = |res: Response| async move { res.ok_into::<u64>().ok() };
+
+        // Collect them in our streams to check:
+        let twos: Vec<u64> = twos.filter_map(into_u64).collect().await;
+        let twos_2: Vec<u64> = twos_2.filter_map(into_u64).collect().await;
+        let threes: Vec<u64> = threes.filter_map(into_u64).collect().await;
+        let rest: Vec<u64> = rest.filter_map(into_u64).collect().await;
+        let bools: Vec<_> = bools.collect().await;
+
+        let expected_twos = vec![0,2,4,6,8,10,12,14,16,18];
+        let expected_threes = vec![0,3,6,9,12,15,18];
+        let expected_rest = vec![1,5,7,11,13,17,19];
+
+        assert_eq!(twos, expected_twos);
+        assert_eq!(twos_2, expected_twos);
+        assert_eq!(threes, expected_threes);
+        assert_eq!(rest, expected_rest);
+        assert!(bools.is_empty());
 
         Ok(())
     }

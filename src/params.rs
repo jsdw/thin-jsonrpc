@@ -157,10 +157,10 @@ impl <const N: usize, P: Serialize> IntoRpcParams for [P; N] {
 // Tuples of different sizes can be used as positional params.
 macro_rules! impl_tuple_params {
     ($($ident:ident)*) => {
-        impl <$($ident),*> IntoRpcParams for ($($ident),*,)
+        impl <$($ident),*> IntoRpcParams for ($($ident,)*)
         where $($ident: Serialize),*
         {
-            #[allow(non_snake_case)]
+            #[allow(non_snake_case, unused_mut)]
             fn into_rpc_params(self) -> RpcParams {
                 let ($($ident,)*) = self;
                 let mut params = ArrayParams::new();
@@ -173,6 +173,7 @@ macro_rules! impl_tuple_params {
     }
 }
 
+impl_tuple_params!();
 impl_tuple_params!(A);
 impl_tuple_params!(A B);
 impl_tuple_params!(A B C);
