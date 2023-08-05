@@ -141,5 +141,51 @@ macro_rules! params {
         a
     }}
 }
-
 pub use params;
+
+// Arrays can be used as positional params.
+impl <const N: usize, P: Serialize> IntoRpcParams for [P; N] {
+    fn into_rpc_params(self) -> RpcParams {
+        let mut params = ArrayParams::new();
+        for p in self {
+            params = params.insert(p)
+        }
+        params.into_rpc_params()
+    }
+}
+
+// Tuples of different sizes can be used as positional params.
+macro_rules! impl_tuple_params {
+    ($($ident:ident)*) => {
+        impl <$($ident),*> IntoRpcParams for ($($ident),*,)
+        where $($ident: Serialize),*
+        {
+            #[allow(non_snake_case)]
+            fn into_rpc_params(self) -> RpcParams {
+                let ($($ident,)*) = self;
+                let mut params = ArrayParams::new();
+                $(
+                    params = params.insert($ident);
+                )*
+                params.into_rpc_params()
+            }
+        }
+    }
+}
+
+impl_tuple_params!(A);
+impl_tuple_params!(A B);
+impl_tuple_params!(A B C);
+impl_tuple_params!(A B C D);
+impl_tuple_params!(A B C D E);
+impl_tuple_params!(A B C D E F);
+impl_tuple_params!(A B C D E F G);
+impl_tuple_params!(A B C D E F G H);
+impl_tuple_params!(A B C D E F G H I);
+impl_tuple_params!(A B C D E F G H I J);
+impl_tuple_params!(A B C D E F G H I J K);
+impl_tuple_params!(A B C D E F G H I J K L);
+impl_tuple_params!(A B C D E F G H I J K L M);
+impl_tuple_params!(A B C D E F G H I J K L M N);
+impl_tuple_params!(A B C D E F G H I J K L M N O);
+impl_tuple_params!(A B C D E F G H I J K L M N O P);

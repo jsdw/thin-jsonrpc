@@ -169,9 +169,6 @@ impl Stream for ResponseStreamMaster {
     type Item = Result<(), ResponseStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
-        // We never return from this future unless the backend gives
-        // us a Pending (so we know we'll wake again) or we get an error
-        // (so we return it and end).
         let this = &mut *self;
 
         if this.done {

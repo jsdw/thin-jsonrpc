@@ -83,8 +83,8 @@ impl <'a> RawResponse<'a> {
 
     /// Construct an "ok" response from an optional ID and serializable "result" value.
     /// Panics if the value given does not serialize to valid JSON.
-    pub fn ok_from_value<V: serde::Serialize, Id: ToString>(id: Option<Id>, value: &V) -> RawResponse<'static> {
-        let value = serde_json::value::to_raw_value(value).expect("invalid json");
+    pub fn ok_from_value<V: serde::Serialize, Id: ToString>(id: Option<Id>, value: V) -> RawResponse<'static> {
+        let value = serde_json::value::to_raw_value(&value).expect("invalid json");
         RawResponse::Ok(OkResponse {
             jsonrpc: "2.0".into(),
             id: id.map(|id| Cow::Owned(id.to_string())),

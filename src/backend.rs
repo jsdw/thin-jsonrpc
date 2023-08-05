@@ -70,8 +70,8 @@ pub mod mock {
 
     #[derive(Default)]
     struct MockBackendInner {
-        handlers: HashMap<&'static str, Box<dyn Fn(MockBackend, MockRequest) + Send + 'static>>,
-        sender_dropped: bool,
+        handlers: HashMap<&'static str, Arc<dyn Fn(MockBackend, MockRequest) + Send + Sync + 'static>>,
+        stopped: bool,
         send_waker: Option<std::task::Waker>,
         send_queue: VecDeque<Vec<u8>>,
     }
@@ -79,13 +79,19 @@ pub mod mock {
     impl MockBackend {
         /// Add a handler.
         pub fn handler<F>(&self, name: &'static str, callback: F) -> &Self
-        where F: Fn(MockBackend, MockRequest) + Send + 'static
+        where F: Fn(MockBackend, MockRequest) + Send + Sync + 'static
         {
-            self.inner.lock().unwrap().handlers.insert(name, Box::new(callback));
+            self.inner.lock().unwrap().handlers.insert(name, Arc::new(callback));
             self
         }
 
-        /// Send a [`crate::Response`] back.
+        /// Send an OK response back
+        pub fn send_ok_response<Id: ToString, V: serde::Serialize>(&self, id: Option<Id>, value: V) {
+            let res = crate::RawResponse::ok_from_value(id, value);
+            self.send_response(res)
+        }
+
+        /// Send a [`crate::RawResponse`] back.
         pub fn send_response(&self, response: crate::RawResponse<'_>) {
             let res = serde_json::to_string(&response).unwrap();
             self.send_bytes(res.into_bytes())
@@ -96,7 +102,15 @@ pub mod mock {
             let mut inner = self.inner.lock().unwrap();
             inner.send_queue.push_back(bytes);
             if let Some(waker) = inner.send_waker.take() {
-                println!("WAKER WAKING");
+                waker.wake();
+            }
+        }
+
+        /// Shut the backend down.
+        pub fn shutdown(&self) {
+            let mut inner = self.inner.lock().unwrap();
+            inner.stopped = true;
+            if let Some(waker) = inner.send_waker.take() {
                 waker.wake();
             }
         }
@@ -104,18 +118,7 @@ pub mod mock {
 
     impl Drop for MockBackendSender {
         fn drop(&mut self) {
-            if let Ok(mut inner) = self.inner.lock() {
-                inner.sender_dropped = true;
-                // We've dropped the BackendSender, which signals to the backend
-                // to shut down. So, any messages we were going to send
-                // to the client are now thrown away.
-                inner.send_queue = VecDeque::new();
-                // Wake the receiver so it can collect a `None` and see that
-                // things have shut down.
-                if let Some(waker) = inner.send_waker.take() {
-                    waker.wake();
-                }
-            }
+            MockBackend { inner: self.inner.clone() }.shutdown();
         }
     }
 
@@ -126,15 +129,22 @@ pub mod mock {
             };
 
             let mock_backend = MockBackend { inner: self.inner.clone() };
-            let inner = self.inner.lock().unwrap();
 
+            // Complain if not 2.0
             if req.jsonrpc != "2.0" {
                 mock_backend.send_response(RawResponse::err_from_value(req.id, ErrorObject {
                     code: crate::raw_response::CODE_PARSE_ERROR,
                     message: format!("\"jsonrpc\" field was not equal to \"2.0\", was {}", req.jsonrpc).into(),
                     data: None
                 }));
-            } else if let Some(handler) = inner.handlers.get(req.method.as_str()) {
+                return Box::pin(std::future::ready(Ok(())))
+            }
+
+            // Acquire lock only long enough to ge a copy our our handler, so we don't deadlock
+            // trying to call the handler or send some other response (which will also lock).
+            let maybe_handler = self.inner.lock().unwrap().handlers.get(req.method.as_str()).cloned();
+
+            if let Some(handler) = maybe_handler {
                 handler(mock_backend, req);
             } else {
                 mock_backend.send_response(RawResponse::err_from_value(req.id, ErrorObject {
@@ -153,7 +163,7 @@ pub mod mock {
             let inner = self.inner.clone();
             Box::pin(std::future::poll_fn(move |cx| {
                 let mut inner = inner.lock().unwrap();
-                if inner.sender_dropped {
+                if inner.stopped {
                     Poll::Ready(None)
                 } else if let Some(item) = inner.send_queue.pop_front() {
                     Poll::Ready(Some(Ok(item)))

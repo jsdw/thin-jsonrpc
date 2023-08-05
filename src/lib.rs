@@ -244,18 +244,16 @@ impl Stream for ServerNotificationStream {
 mod test {
     use super::*;
     use backend::mock::{ self, MockBackend };
-    use raw_response::RawResponse;
     use futures_util::StreamExt;
+    use crate::response::ErrorObject;
+
+    type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
     fn mock_client() -> (Client, MockBackend) {
         let (mock_backend, mock_send, mock_recv) = mock::build();
         let (client, mut driver) = Client::from_backend(mock_send, mock_recv);
-        tokio::spawn(async move {
-            println!("HELLO!!")
-        });
         // Drive the receipt of messages until a shutdown happens.
         tokio::spawn(async move {
-            eprintln!("SPAWNED");
             while let Some(res) = driver.next().await {
                 if let Err(err) = res {
                     eprintln!("ClientDriver Error: {err}");
@@ -266,22 +264,43 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_request() {
+    async fn test_basic_requests() -> Result<(), Error> {
         let (mut client, backend) = mock_client();
 
-        backend.handler("echo", |cx, req| {
-            cx.send_response(RawResponse::ok_from_value(req.id, &req.params))
-        });
+        backend
+            .handler("echo_ok_raw", |cx, req| {
+                let id = req.id.unwrap_or("-1".to_string());
+                let params = req.params;
+                let res = format!(r#"{{ "jsonrpc": "2.0", "id": "{id}", "result": {params} }}"#);
+                cx.send_bytes(res.into_bytes());
+            })
+            .handler("echo_err_raw", |cx, req| {
+                let id = req.id.unwrap_or("-1".to_string());
+                let params = req.params;
+                let res = format!(r#"{{ "jsonrpc": "2.0", "id": "{id}", "error": {{ "code":123, "message":"Eep!", "data": {params} }} }}"#);
+                cx.send_bytes(res.into_bytes());
+            })
+            .handler("add", |cx, req| {
+                let (a, b): (i64, i64) = serde_json::from_str(req.params.get()).unwrap();
+                cx.send_ok_response(req.id, a+b);
+            });
 
-        let server_notifications = client.server_notifications();
-        tokio::spawn(async move {
-            let mut leftovers = server_notifications.leftovers();
-            while let Some(item) = leftovers.next().await {
-                println!("Leftover: {item:?}");
-            }
-        });
-
-        let res: Vec<u8> = client.request("echo", params![1,2,3]).await.unwrap().ok_into().unwrap();
+        // Check we can decode ok response properly.
+        let res: Vec<u8> = client.request("echo_ok_raw", (1,2,3)).await?.ok_into()?;
         assert_eq!(res, vec![1,2,3]);
+
+        // Check we can decode error response properly.
+        let err: ErrorObject<Vec<u8>> = client.request("echo_err_raw", (1,2,3)).await?.error_into()?;
+        assert_eq!(err.code, 123);
+        assert_eq!(err.message, "Eep!");
+        assert_eq!(err.data, vec![1,2,3]);
+
+        // Ensure ID's are incremented and such.
+        for i in 0i64..500 {
+            let res: i64 = client.request("add", (i, 1)).await?.ok_into()?;
+            assert_eq!(res, i + 1);
+        }
+
+        Ok(())
     }
 }
