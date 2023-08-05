@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 /// Something that can be handed bytes to send out. There is one copy of this
 /// that is not shared, and when our [`crate::Client`] is dropped, this will be too.
-pub trait BackendSender: Send + 'static {
+pub trait BackendSender: Send + Sync + 'static {
     /// Send a message to the JSON-RPC server, emitting an error if something goes wrong.
     /// The message should be serializable to a valid JSON-RPC object.
-    fn send(&mut self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'static>>;
+    fn send(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'static>>;
 }
 
 /// Something that can receive bytes.
@@ -132,7 +132,7 @@ pub mod mock {
     }
 
     impl BackendSender for MockBackendSender {
-        fn send(&mut self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'static>> {
+        fn send(&self, data: &[u8]) -> Pin<Box<dyn Future<Output = Result<(), BackendError>> + Send + 'static>> {
             let Ok(req) = serde_json::from_slice::<MockRequest>(data) else {
                 eprintln!("Error decoding: {}", std::str::from_utf8(data).unwrap());
                 return Box::pin(std::future::ready(Ok(())))

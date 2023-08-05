@@ -3,7 +3,7 @@ use crate::raw_response::RawResponse;
 
 /// A JSON-RPC response.
 #[derive(Debug, Clone)]
-pub struct Response(Arc<RawResponse<'static>>);
+pub struct Response(pub(crate) Arc<RawResponse<'static>>);
 
 /// An error returned from trying to deserialize the response.
 #[derive(derive_more::Display, Debug)]
@@ -27,10 +27,6 @@ impl std::error::Error for ResponseError {
 }
 
 impl Response {
-    pub(crate) fn new(res: Arc<RawResponse<'static>>) -> Self {
-        Self(res)
-    }
-
     /// Hand back the raw response from the server.
     pub fn raw(&self) -> &RawResponse<'static> {
         &self.0

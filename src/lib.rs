@@ -16,12 +16,14 @@ pub mod raw_response;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
-use response_stream::{ResponseStream, ResponseStreamMaster, ResponseStreamHandle};
+use response::ErrorObject;
+use response_stream::{ResponseStreamMaster, ResponseStreamHandle};
 use raw_response::{RawResponse};
 use backend::{BackendSender, BackendReceiver};
 use params::IntoRpcParams;
 use std::sync::atomic::{ AtomicU64, Ordering };
 use std::sync::Arc;
+use std::pin::Pin;
 use std::task::Poll;
 
 pub use response::{ Response, ResponseError };
@@ -49,9 +51,10 @@ impl std::error::Error for RequestError {
 
 /// A JSON-RPC client. Build this by calling [`Client::from_backend()`]
 /// and providing a suitable sender and receiver.
+#[derive(Clone)]
 pub struct Client {
-    next_id: AtomicU64,
-    sender: Box<dyn BackendSender>,
+    next_id: Arc<AtomicU64>,
+    sender: Arc<dyn BackendSender>,
     stream: ResponseStreamHandle,
 }
 
@@ -77,8 +80,8 @@ impl Client {
         let master = ResponseStreamMaster::new(Box::new(recv));
 
         let client = Client {
-            next_id: AtomicU64::new(1),
-            sender: Box::new(send),
+            next_id: Arc::new(AtomicU64::new(1)),
+            sender: Arc::new(send),
             stream: master.handle()
         };
         let client_driver = ClientDriver(master);
@@ -88,7 +91,7 @@ impl Client {
 
     /// Make a request to the RPC server. This will return either a response or an error,
     /// and will attempt to deserialize the response into the type you've asked for.
-    pub async fn request<Params>(&mut self, method: &str, params: Params) -> Result<Response, RequestError>
+    pub async fn request<Params>(&self, method: &str, params: Params) -> Result<Response, RequestError>
     where Params: IntoRpcParams
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
@@ -102,13 +105,13 @@ impl Client {
         };
 
         // Subscribe to responses with the matching ID.
-        let mut response_stream = self.stream.with_filter(Arc::new(move |res| {
+        let mut response_stream = self.stream.response_stream().filter(move |res| {
             let Some(msg_id) = res.id() else {
-                return false
+                return std::future::ready(false)
             };
 
-            id == msg_id
-        }));
+            std::future::ready(id == msg_id)
+        });
 
         // Now we're set up to wait for the reply, send the request.
         self.sender
@@ -121,7 +124,7 @@ impl Client {
 
         match response {
             Some(res) => {
-                Ok(Response::new(res))
+                Ok(Response(res))
             },
             None => {
                 Err(RequestError::ConnectionClosed)
@@ -148,7 +151,14 @@ impl Client {
     /// Obtain a stream of server notifications from the backend that aren't linked to
     /// any specific request.
     pub fn server_notifications(&self) -> ServerNotifications {
-        ServerNotifications(self.stream.clone())
+        ServerNotifications(Box::pin(self.stream.response_stream().filter_map(move |res| {
+            // Always Ignore responses to requests:
+            if res.id().is_some() {
+                return std::future::ready(None)
+            }
+
+            std::future::ready(Some(Response(res)))
+        })))
     }
 }
 
@@ -157,8 +167,9 @@ impl Client {
 /// (by polling this less often), and allows us to drive multiple notification streams
 /// without requiring any specific async runtime. It will return:
 ///
-/// - `Some(Ok(()))` if it successfully received and delivered a message.
-/// - `Some(Err(e))` if it failed to deliver a message for some reason.
+/// - `Some(Ok(response))` if it successfully received a response.
+/// - `Some(Err(e))` if it failed to parse some bytes into a response, or the response
+///    was invalid.
 /// - `None` if the backend has stopped (either after a fatal error, which will be
 ///   delivered just prior to this, or because the [`Client`] was dropped.
 pub struct ClientDriver(ResponseStreamMaster);
@@ -167,138 +178,74 @@ pub struct ClientDriver(ResponseStreamMaster);
 pub type ClientDriverError = response_stream::ResponseStreamError;
 
 impl Stream for ClientDriver {
-    type Item = Result<(), ClientDriverError>;
+    type Item = Result<Response, ClientDriverError>;
     fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        self.0.poll_next_unpin(cx)
+        self.0.poll_next_unpin(cx).map(|o| o.map(|r| r.map(Response)))
     }
 }
 
-/// A struct representing messages from the server.
-#[derive(Clone)]
-pub struct ServerNotifications(ResponseStreamHandle);
+/// A struct representing messages from the server. This
+/// implements [`futures_util::Stream`] and provides a couple of
+/// additional helper methods to further filter the stream.
+pub struct ServerNotifications(Pin<Box<dyn Stream<Item=Response> + Send + Sync + 'static>>);
 
 impl ServerNotifications {
-    /// Return any notifications not being handed to any non "leftovers" stream.
-    /// This is the equivalent of the "404" route for unwanted notifications.
-    pub fn leftovers(&self) -> ServerNotificationStream {
-        ServerNotificationStream::new(self.0.leftovers())
+    /// This is analogous to [`Response::ok_into()`], but will apply to each
+    /// notification in the stream, filtering out any that don't deserialize into
+    /// the given type.
+    pub fn ok_into<R>(self) -> impl Stream<Item=R> + Send + Sync + 'static
+    where
+        R: for<'de> serde::de::Deserialize<'de> + Send + Sync + 'static,
+    {
+        self.filter_map(move |res| {
+            match res.ok_into() {
+                Err(_) => std::future::ready(None),
+                Ok(r) => std::future::ready(Some(r))
+            }
+        })
     }
 
-    /// Filter the incoming stream of notifications and only return
-    /// matching messages. Messages can be "ok" or "error" types.
-    pub fn filtered<F>(&self, filter_fn: F) -> ServerNotificationStream
+    /// Like [`ServerNotifications::ok_into()`], but also accepts a filter function to
+    /// ignore any values that we're not interested in.
+    pub fn ok_into_if<R, F>(self, filter_fn: F) -> impl Stream<Item=R> + Send + Sync + 'static
     where
-        F: Fn(&RawResponse<'_>) -> bool + Send + Sync + 'static
+        R: for<'de> serde::de::Deserialize<'de> + Send + Sync + 'static,
+        F: Fn(&R) -> bool + Send + Sync + 'static
     {
-        let f: response_stream::FilterFn = Arc::new(move |res| {
-            // Always Ignore responses to requests:
-            if res.id().is_some() {
-                return false
-            }
-
-            // Apply user filter:
-            filter_fn(res)
-        });
-
-        ServerNotificationStream::new(self.0.with_filter(f))
+        self.ok_into().filter(move |n| std::future::ready(filter_fn(n)))
     }
 
-    /// Filter the incoming stream of notifications and only return
-    /// matching messages. Only "ok" responses are filtered,
-    pub fn filtered_oks<F>(&self, filter_fn: F) -> ServerNotificationStream
+    /// This is analogous to [`Response::error_into()`], but will apply to each
+    /// notification in the stream, filtering out any that don't deserialize into
+    /// the given type.
+    pub fn error_into<R>(self) -> impl Stream<Item=ErrorObject<R>> + Send + Sync + 'static
     where
-        F: Fn(&raw_response::OkResponse<'_>) -> bool + Send + Sync + 'static
+        R: for<'de> serde::de::Deserialize<'de> + Send + Sync + 'static,
     {
-        let f: response_stream::FilterFn = Arc::new(move |res| {
-            // Always Ignore responses to requests:
-            if res.id().is_some() {
-                return false
+        self.filter_map(move |res| {
+            match res.error_into() {
+                Err(_) => std::future::ready(None),
+                Ok(r) => std::future::ready(Some(r))
             }
-
-            match res {
-                RawResponse::Ok(r) => filter_fn(r),
-                RawResponse::Error(_) => false
-            }
-        });
-
-        ServerNotificationStream::new(self.0.with_filter(f))
+        })
     }
 
-    /// Filter the incoming stream of notifications and only return
-    /// matching messages that can be properly deserialized into the target
-    /// type. This deserializing should aim to be fast, since the filter will
-    /// run against almost every incoming message.
-    pub fn filtered_oks_as<R, F>(&self, filter_fn: F) -> ServerNotificationStream
+    /// Like [`ServerNotifications::error_into()`], but also accepts a filter function to
+    /// ignore any values that we're not interested in.
+    pub fn error_into_if<R, F>(self, filter_fn: F) -> impl Stream<Item=ErrorObject<R>> + Send + Sync + 'static
     where
-        R: for<'de> serde::de::Deserialize<'de>,
-        F: Fn(R) -> bool + Send + Sync + 'static
+        R: for<'de> serde::de::Deserialize<'de> + Send + Sync + 'static,
+        F: Fn(&ErrorObject<R>) -> bool + Send + Sync + 'static
     {
-        let f: response_stream::FilterFn = Arc::new(move |res| {
-            // Always Ignore responses to requests:
-            if res.id().is_some() {
-                return false
-            }
-
-            let RawResponse::Ok(res) = res else {
-                return false
-            };
-
-            // Deserialize message result:
-            let s = res.result.get();
-            let Ok(r) = serde_json::from_str(s) else {
-                return false
-            };
-
-            filter_fn(r)
-        });
-
-        ServerNotificationStream::new(self.0.with_filter(f))
-    }
-
-    /// Filter the incoming stream of notifications and only return
-    /// matching messages. Only "ok" responses are filtered,
-    pub fn filtered_errors<F>(&self, filter_fn: F) -> ServerNotificationStream
-    where
-        F: Fn(&raw_response::ErrorResponse<'_>) -> bool + Send + Sync + 'static
-    {
-        let f: response_stream::FilterFn = Arc::new(move |res| {
-            // Always Ignore responses to requests:
-            if res.id().is_some() {
-                return false
-            }
-
-            match res {
-                RawResponse::Ok(_) => false,
-                RawResponse::Error(err) => filter_fn(err)
-            }
-        });
-
-        ServerNotificationStream::new(self.0.with_filter(f))
+        self.error_into().filter(move |n| std::future::ready(filter_fn(n)))
     }
 }
 
-/// A stream of server notifications. This implements [`futures_core::Stream`].
-/// The easiest way to work with it is to pull in [`futures_util::StreamExt`],
-/// which provides a bunch of nice helper methods on streams.
-#[derive(Clone)]
-pub struct ServerNotificationStream {
-    stream: ResponseStream
-}
 
-impl ServerNotificationStream {
-    fn new(stream: ResponseStream) -> Self {
-        Self { stream }
-    }
-}
-
-impl Stream for ServerNotificationStream {
+impl Stream for ServerNotifications {
     type Item = Response;
-
-    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
-        // Safety: I'm not moving anything around,
-        // so the Pin promise is preserved.
-        let this = unsafe { self.get_unchecked_mut() };
-        this.stream.poll_next_unpin(cx).map(|o| o.map(Response::new))
+    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
+        self.0.poll_next_unpin(cx)
     }
 }
 
@@ -329,7 +276,7 @@ mod test {
 
     #[tokio::test]
     async fn test_basic_requests() -> Result<(), Error> {
-        let (mut client, driver, backend) = mock_client();
+        let (client, driver, backend) = mock_client();
         drive_client(driver);
 
         backend
@@ -385,38 +332,23 @@ mod test {
             });
 
         // Subscribe to messages:
-        let twos = client.server_notifications().filtered_oks_as(|res: u64| res % 2 == 0);
-        let twos_2 = twos.clone();
-        let threes = client.server_notifications().filtered_oks_as(|res: u64| res % 3 == 0);
-        let bools = client.server_notifications().filtered_oks_as(|_: bool| true);
-        let rest = client.server_notifications().leftovers();
-        let rest_2 = client.server_notifications().leftovers();
+        let twos = client.server_notifications().ok_into_if(|n: &u64| n % 2 == 0);
+        let threes = client.server_notifications().ok_into_if(|res: &u64| res % 3 == 0);
+        let bools = client.server_notifications().ok_into::<bool>();
 
         // Start sending notifications.
         client.notification("start_sending", ()).await?;
 
-        // Even though we deserialized to filter, we still need to deserialize the
-        // actual notifications later. (The filter should aim to deserialize as
-        // little as possible to filter).
-        let into_u64 = |res: Response| async move { res.ok_into::<u64>().ok() };
-
         // Collect them in our streams to check:
-        let rest: Vec<u64> = rest.filter_map(into_u64).collect().await;
-        let rest_2: Vec<u64> = rest_2.filter_map(into_u64).collect().await;
-        let twos: Vec<u64> = twos.filter_map(into_u64).collect().await;
-        let twos_2: Vec<u64> = twos_2.filter_map(into_u64).collect().await;
-        let threes: Vec<u64> = threes.filter_map(into_u64).collect().await;
+        let twos: Vec<u64> = twos.collect().await;
+        let threes: Vec<u64> = threes.collect().await;
         let bools: Vec<_> = bools.collect().await;
 
         let expected_twos = vec![0,2,4,6,8,10,12,14,16,18];
         let expected_threes = vec![0,3,6,9,12,15,18];
-        let expected_rest = vec![1,5,7,11,13,17,19];
 
         assert_eq!(twos, expected_twos);
-        assert_eq!(twos_2, expected_twos);
         assert_eq!(threes, expected_threes);
-        assert_eq!(rest, expected_rest);
-        assert_eq!(rest_2, expected_rest);
         assert!(bools.is_empty());
 
         Ok(())

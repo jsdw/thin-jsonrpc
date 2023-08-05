@@ -36,8 +36,7 @@ pub type ResponseStreamItem = Arc<RawResponse<'static>>;
 pub struct ResponseStream {
     id: u64,
     queue: VecDeque<ResponseStreamItem>,
-    inner: Arc<Mutex<ResponseStreamInner>>,
-    is_for_leftovers: bool
+    inner: Arc<Mutex<ResponseStreamInner>>
 }
 
 impl Stream for ResponseStream {
@@ -55,10 +54,8 @@ impl Stream for ResponseStream {
         let mut inner = this.inner.lock().unwrap();
         let inner = &mut *inner;
 
-        let instance = match this.is_for_leftovers {
-            true => inner.leftover_instances.get_mut(&this.id).expect("instance should exist"),
-            false => inner.instances.get_mut(&this.id).expect("instance should exist"),
-        };
+        let instance = inner.instances.get_mut(&this.id)
+            .expect("instance should always exist");
 
         // Next, if there are items in the shared queue then put those into
         // our local queue and return from them.
@@ -84,35 +81,24 @@ impl Clone for ResponseStream {
     fn clone(&self) -> Self {
         let mut inner = self.inner.lock().expect("can obtain lock");
 
-        let old_instance = match self.is_for_leftovers {
-            true => inner.leftover_instances.get(&self.id)
-                .expect("leftover instance should exist"),
-            false => inner.instances.get(&self.id)
-                .expect("instance should exist")
-        };
+        let old_instance = inner.instances.get(&self.id)
+                .expect("instance should exist");
 
         let new_instance = Instance {
-            filter_fn: old_instance.filter_fn.clone(),
             waker: None,
             queue: old_instance.queue.clone()
         };
 
         let new_id = inner.next_id;
-
-        if self.is_for_leftovers {
-            inner.leftover_instances.insert(new_id, new_instance);
-        } else {
-            inner.instances.insert(new_id, new_instance);
-        }
-
         inner.next_id += 1;
+        inner.instances.insert(new_id, new_instance);
+
         drop(inner);
 
         Self {
             id: new_id,
             queue: self.queue.clone(),
             inner: self.inner.clone(),
-            is_for_leftovers: self.is_for_leftovers,
         }
     }
 }
@@ -121,12 +107,21 @@ impl Drop for ResponseStream {
     fn drop(&mut self) {
         if let Ok(mut inner) = self.inner.lock() {
             // De-register this instance:
-            if self.is_for_leftovers {
-                inner.leftover_instances.remove(&self.id);
-            } else {
-                inner.instances.remove(&self.id);
-            }
+            inner.instances.remove(&self.id);
         }
+    }
+}
+
+/// A handle to create response streams with.
+#[derive(Clone, Debug)]
+pub struct ResponseStreamHandle {
+    inner: Arc<Mutex<ResponseStreamInner>>
+}
+
+impl ResponseStreamHandle {
+    /// Create a [`ResponseStream`].
+    pub fn response_stream(&self) -> ResponseStream {
+        create_response_stream(self.inner.clone())
     }
 }
 
@@ -153,20 +148,18 @@ impl ResponseStreamMaster {
                 done: false,
                 next_id: 1,
                 instances: HashMap::new(),
-                leftover_instances: HashMap::new(),
             }))
         }
     }
 
-    /// Create a [`ResponseStreamHandle`], which doesn't do anything on its
-    /// own except allow the creation of [`ResponseStream`]s.
+    /// Create a handle to use to build response streams.
     pub fn handle(&self) -> ResponseStreamHandle {
         ResponseStreamHandle { inner: self.inner.clone() }
     }
 }
 
 impl Stream for ResponseStreamMaster {
-    type Item = Result<(), ResponseStreamError>;
+    type Item = Result<Arc<RawResponse<'static>>, ResponseStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
@@ -222,55 +215,23 @@ impl Stream for ResponseStreamMaster {
                 // The calling code can call the future again to resume.
                 return Poll::Ready(Some(Err(err.into())))
             },
-            Ok(r) => r,
+            Ok(r) => Arc::new(r.into_owned()),
         };
 
-        // At this point, we need to lock the shared state to find out
-        // who to broadcast the message to.
+        // At this point, we need to lock the shared state to
+        // broadcast the response.
         let mut inner = this.inner.lock().unwrap();
         let inner = &mut *inner;
 
-        let mut cached_response_item = None;
         for instance in inner.instances.values_mut() {
-            // This instance doesn't care; continue. No filter fn means
-            // it will accept anything.
-            if let Some(filter_fn) = &mut instance.filter_fn {
-                if !filter_fn(&response) {
-                    continue
-                }
-            }
-
-            // Clone cached item if it's there (it's an Arc), or take ownership of
-            // the `Response` and put it in an Arc for cheaper broadcasting.
-            let response_item = match &cached_response_item {
-                None => {
-                    let response_item = Arc::new(response.clone().into_owned());
-                    cached_response_item = Some(response_item.clone());
-                    response_item
-                },
-                Some(res) => res.clone()
-            };
-
-            // Tell the instance about the item it's interested in:
-            instance.queue.push_back(response_item);
+            instance.queue.push_back(response.clone());
             if let Some(waker) = instance.waker.take() {
                 waker.wake();
             }
         }
 
-        // Nothing accepted the message; send it to any "leftover" instances we have.
-        if cached_response_item.is_none() && !inner.leftover_instances.is_empty() {
-            let response_item = Arc::new(response.into_owned());
-            for leftover_instance in inner.leftover_instances.values_mut() {
-                leftover_instance.queue.push_back(response_item.clone());
-                if let Some(waker) = leftover_instance.waker.take() {
-                    waker.wake();
-                }
-            }
-        }
-
         // We've successfully handled a message; allow the caller to react.
-        Poll::Ready(Some(Ok(())))
+        Poll::Ready(Some(Ok(response)))
     }
 }
 
@@ -283,32 +244,6 @@ impl Drop for ResponseStreamMaster {
     }
 }
 
-/// A handle to create [`ResponseStream`]s from.
-#[derive(Clone, Debug)]
-pub struct ResponseStreamHandle {
-    inner: Arc<Mutex<ResponseStreamInner>>
-}
-
-impl ResponseStreamHandle {
-    /// Return any messages that no other stream wants. This can be useful
-    /// for diagnostics and debugging, since ordinarily we'd expect to be handling
-    /// any messages that are sent our way.
-    pub fn leftovers(&self) -> ResponseStream {
-        create_response_stream(self.inner.clone(), None, true)
-    }
-
-    /// Filter the [`ResponseStream`] based on the function provided. This
-    /// function is expected to be fast, and can block progression of other
-    /// streams if it is too slow. Prefer the combinators on [`futures::StreamExt`]
-    /// if you need to run slow or async logic.
-    pub fn with_filter(&self, filter_fn: FilterFn) -> ResponseStream {
-        create_response_stream(self.inner.clone(), Some(filter_fn), false)
-    }
-}
-
-/// The type of function used to filter the notification stream.
-pub type FilterFn = Arc<dyn Fn(&RawResponse<'_>) -> bool + Send + Sync + 'static>;
-
 #[derive(Debug)]
 struct ResponseStreamInner {
     // Don't poll any more; we hit an error so we're done.
@@ -317,15 +252,11 @@ struct ResponseStreamInner {
     next_id: u64,
     // Track instance details.
     instances: HashMap<u64, Instance>,
-    // Things registered to receive "leftovers" not consumed by anything else
-    leftover_instances: HashMap<u64, Instance>
 }
 
 /// Create a [`ResponseStream`] given the shared `inner` content.
 fn create_response_stream(
     inner: Arc<Mutex<ResponseStreamInner>>,
-    filter_fn: Option<FilterFn>,
-    is_for_leftovers: bool
 ) -> ResponseStream {
     let mut guard = inner.lock().unwrap();
     let id = guard.next_id;
@@ -334,16 +265,11 @@ fn create_response_stream(
     guard.next_id += 1;
 
     let instance = Instance {
-        filter_fn,
         queue: VecDeque::new(),
         waker: None
     };
 
-    if is_for_leftovers {
-        guard.leftover_instances.insert(id, instance);
-    } else {
-        guard.instances.insert(id, instance);
-    }
+    guard.instances.insert(id, instance);
 
     drop(guard);
 
@@ -351,22 +277,12 @@ fn create_response_stream(
         id,
         queue: VecDeque::new(),
         inner,
-        is_for_leftovers
     }
 }
 
 /// This represents a single response stream.
+#[derive(Debug)]
 struct Instance {
     waker: Option<Waker>,
-    filter_fn: Option<FilterFn>,
     queue: VecDeque<ResponseStreamItem>
-}
-
-impl std::fmt::Debug for Instance {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Instance")
-            .field("waker", &self.waker)
-            .field("filter_fn", &"<function>")
-            .field("queue", &self.queue).finish()
-    }
 }
