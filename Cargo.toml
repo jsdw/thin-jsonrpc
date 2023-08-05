@@ -11,3 +11,6 @@ futures-core = "0.3.28"
 futures-util = "0.3.28"
 serde = { version = "1.0.175", features = ["derive"] }
 serde_json = { version = "1.0.103", features = ["raw_value"] }
+
+[dev-dependencies]
+tokio = { version = "1.29.1", features = ["full"] }

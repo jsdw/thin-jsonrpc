@@ -1,152 +1,39 @@
-use serde_json::value::RawValue;
-use std::borrow::Cow;
+use std::sync::Arc;
+use crate::raw_response::RawResponse;
 
-/// An error handed back when we cannot correctly deserialize
-/// bytes into our [`Response`] object.
-#[derive(Debug, derive_more::From, derive_more::Display)]
+/// A JSON-RPC response.
+#[derive(Debug, Clone)]
+pub struct Response(Arc<RawResponse<'static>>);
+
+/// An error returned from trying to deserialize the response.
+#[derive(derive_more::Display, Debug)]
 pub enum ResponseError {
-    /// There was an error deserializing the response.
-    #[from]
-    #[display(fmt = "{error}")]
-    Deserialize {
-        /// The underlying serde error.
-        error: serde_json::Error,
-        /// The raw bytes that we failed to deserialize.
-        bytes: Vec<u8>
-    },
-    /// The "jsonrpc" field did not equal "2.0".
-    #[display(fmt = "failed to decode response: expected '\"jsonrpc\": \"2.0\"'")]
-    InvalidVersion {
-        /// The raw bytes that we failed to deserialize.
-        bytes: Vec<u8>
-    }
+    /// A JSON-RPC error object was returned. and so the "ok"
+    /// value could not be deserialized.
+    #[display(fmt = "A JSON-RPC error was returned, so the response could not be deserialized")]
+    RpcErrorReturned,
+    /// An error deserializing some received JSON into the expected
+    /// JSON-RPC format.
+    Deserialize(serde_json::Error),
 }
 
-/// A JSON-RPC response is either a "result" or "error" payload.
-/// This represents the shape a message can deserialize into.
-#[derive(Clone, Debug)]
-pub enum Response<'a> {
-    /// A JSON-RPC "result" response.
-    Ok(OkResponse<'a>),
-    /// A JSON-RPC "error" response.
-    Err(ErrorResponse<'a>)
-}
-
-impl <'a> Response<'a> {
-    /// Return the ID associated with the response, if there is one.
-    /// Notifications from the server that aren't associated with a
-    /// request won't.
-    pub fn id(&self) -> Option<&str> {
-        match self {
-            Response::Ok(r) => r.id.as_deref(),
-            Response::Err(e) => e.id.as_deref()
-        }
+impl Response {
+    pub(crate) fn new(res: Arc<RawResponse<'static>>) -> Self {
+        Self(res)
     }
 
-    /// Decode some bytes into a valid JSON-RPC response or
-    /// return an error if it's not valid.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Response<'_>, ResponseError> {
-        let res = match serde_json::from_slice(bytes).map(|res| Response::Ok(res)) {
-            Ok(res) => res,
-            Err(_) => serde_json::from_slice(bytes)
-                .map(|res| Response::Err(res))
-                .map_err(|e| ResponseError::Deserialize { error: e, bytes: bytes.to_owned() })?
+    /// Hand back the raw response from the server.
+    pub fn raw(&self) -> &RawResponse<'static> {
+        &self.0
+    }
+
+    /// Deserialize an "ok" response to the requested type.
+    pub fn ok_into<R: serde::de::DeserializeOwned>(&self) -> Result<R, ResponseError> {
+        let res = match self.raw() {
+            RawResponse::Ok(res) => res,
+            RawResponse::Error(_) => return Err(ResponseError::RpcErrorReturned)
         };
 
-        let version = match &res {
-            Response::Ok(r) => &*r.jsonrpc,
-            Response::Err(e) => &*e.jsonrpc,
-        };
-
-        if version != "2.0" {
-            return Err(ResponseError::InvalidVersion { bytes: bytes.to_owned() })
-        }
-
-        Ok(res)
-    }
-
-    /// Take ownership of a [`Response`], removing any lifetimes.
-    pub fn into_owned(self) -> Response<'static> {
-        match self {
-            Response::Ok(res) => {
-                Response::Ok(res.into_owned())
-            },
-            Response::Err(err) => {
-                Response::Err(err.into_owned())
-            }
-        }
-    }
-}
-
-/// A JSON-RPC "result" response.
-#[derive(serde::Deserialize, Clone, Debug)]
-pub struct OkResponse<'a> {
-    #[serde(borrow)]
-    jsonrpc: Cow<'a, str>,
-    /// The message ID. None if this is a server notification.
-    #[serde(borrow)]
-    pub id: Option<Cow<'a, str>>,
-    /// The result body.
-    #[serde(borrow)]
-    pub result: Cow<'a, RawValue>
-}
-
-impl <'a> OkResponse<'a> {
-    /// Take ownership of a [`OkResponse`], removing any lifetimes.
-    pub fn into_owned(self) -> OkResponse<'static> {
-        OkResponse {
-            jsonrpc: Cow::Owned(self.jsonrpc.into_owned()),
-            id: self.id.map(|id| Cow::Owned(id.into_owned())),
-            result: Cow::Owned(self.result.into_owned())
-        }
-    }
-}
-
-/// A JSON-RPC "error" response.
-#[derive(serde::Deserialize, Clone, Debug)]
-pub struct ErrorResponse<'a> {
-    #[serde(borrow)]
-    jsonrpc: Cow<'a, str>,
-    /// The message ID. None if this is a server notification.
-    #[serde(borrow)]
-    pub id: Option<Cow<'a, str>>,
-    /// Error details.
-    #[serde(borrow)]
-    pub error: ErrorObject<'a>
-}
-
-impl <'a> ErrorResponse<'a> {
-    /// Take ownership of a [`ErrorResponse`], removing any lifetimes.
-    pub fn into_owned(self) -> ErrorResponse<'static> {
-        ErrorResponse {
-            jsonrpc: Cow::Owned(self.jsonrpc.into_owned()),
-            id: self.id.map(|id| Cow::Owned(id.into_owned())),
-            error: self.error.into_owned()
-        }
-    }
-}
-
-/// Details about the JSON-RPC error response.
-#[derive(serde::Deserialize, derive_more::Display, Clone, Debug)]
-#[display(fmt = "Error {code}: {message}")]
-pub struct ErrorObject<'a> {
-    /// An error code.
-    pub code: i32,
-    /// A "pretty" error message.
-    #[serde(borrow)]
-    pub message: Cow<'a, str>,
-    /// Some other optional error context.
-    #[serde(borrow)]
-    pub data: Option<Cow<'a, RawValue>>
-}
-
-impl <'a> ErrorObject<'a> {
-    /// Take ownership of a [`ErrorObject`], removing any lifetimes.
-    pub fn into_owned(self) -> ErrorObject<'static> {
-        ErrorObject {
-            code: self.code,
-            message: Cow::Owned(self.message.into_owned()),
-            data: self.data.map(|data| Cow::Owned(data.into_owned()))
-        }
+        serde_json::from_str(res.result.get()).map_err(ResponseError::Deserialize)
     }
 }

@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::future::Future;
 use std::collections::VecDeque;
 use crate::backend::{ BackendReceiver, BackendError };
-use crate::response::{ Response, ResponseError };
+use crate::raw_response::{ RawResponse, ResponseError };
 
 /// An error returned by [`ResponseStreamMaster`] if something
 /// goes wrong attempting to receive/parse a message.
@@ -19,10 +19,17 @@ pub enum ResponseStreamError {
     Response(ResponseError)
 }
 
+impl ResponseStreamError {
+    /// Is the error fatal, ie the client will no longer work.
+    pub fn is_fatal(&self) -> bool {
+        matches!(self, ResponseStreamError::BackendError(_))
+    }
+}
+
 impl std::error::Error for ResponseStreamError {}
 
 /// A single item emitted by a [`ResponseStream`].
-pub type ResponseStreamItem = Arc<Response<'static>>;
+pub type ResponseStreamItem = Arc<RawResponse<'static>>;
 
 /// A stream of [`ResponseStreamItem`]s from the backend. This can be cloned, with
 /// different streams filtering out different messages.
@@ -128,16 +135,16 @@ impl Drop for ResponseStream {
 pub struct ResponseStreamMaster {
     done: bool,
     // This is where messages from the backend come from.
-    recv: Box<dyn BackendReceiver>,
+    recv: Box<dyn BackendReceiver + Send + 'static>,
     // The most recent recv future from the backend.
-    recv_fut: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>, BackendError>>>>>,
+    recv_fut: Option<Pin<Box<dyn Future<Output = Option<Result<Vec<u8>, BackendError>>> + Send + 'static>>>,
     // Shared state.
     inner: Arc<Mutex<ResponseStreamInner>>
 }
 
 impl ResponseStreamMaster {
     /// Create a new [`ResponseStreamMaster`].
-    pub fn new(recv: Box<dyn BackendReceiver>) -> Self {
+    pub fn new(recv: Box<dyn BackendReceiver + Send + 'static>) -> Self {
         ResponseStreamMaster {
             done: false,
             recv,
@@ -159,105 +166,114 @@ impl ResponseStreamMaster {
 }
 
 impl Stream for ResponseStreamMaster {
-    type Item = ResponseStreamError;
+    type Item = Result<(), ResponseStreamError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
-        loop {
-            // We never return from this future unless the backend gives
-            // us a Pending (so we know we'll wake again) or we get an error
-            // (so we return it and end).
-            let this = &mut *self;
+        // We never return from this future unless the backend gives
+        // us a Pending (so we know we'll wake again) or we get an error
+        // (so we return it and end).
+        let this = &mut *self;
 
-            if this.done {
-                // This has already finished.
-                return Poll::Ready(None);
+        if this.done {
+            // This has already finished.
+            return Poll::Ready(None);
+        }
+
+        // Get a future to receive the next item.
+        let mut fut = this.recv_fut.take().unwrap_or_else(|| {
+            this.recv.receive()
+        });
+
+        // Get the item out of the future, or return if it's not ready yet.
+        let res = match fut.poll_unpin(cx) {
+            Poll::Pending => {
+                // Put the future back in the guard if it's not ready yet,
+                // so that we re-use it next time we poll.
+                this.recv_fut = Some(fut);
+                return Poll::Pending
+            },
+            Poll::Ready(res) => {
+                res
+            }
+        };
+
+        // Get the message out of the result. If a backend error or None comes
+        // back, we close any streams.
+        let msg_bytes = match res {
+            None => {
+                // Tell this to stop:
+                this.done = true;
+                // Tell streams to stop:
+                this.inner.lock().unwrap().done = true;
+                return Poll::Ready(None)
+            }
+            Some(Err(err)) => {
+                // Tell this to stop:
+                this.done = true;
+                // Tell streams to stop:
+                this.inner.lock().unwrap().done = true;
+                return Poll::Ready(Some(Err(err.into())))
+            },
+            Some(Ok(msg_bytes)) => msg_bytes
+        };
+
+        // Deserialize the message, borrowing what we can. An error here is recoverable
+        // and won't stop everything.
+        let response = match RawResponse::from_bytes(&msg_bytes) {
+            Err(err) => {
+                // This error can be ignored but will be handed back.
+                // The calling code can call the future again to resume.
+                return Poll::Ready(Some(Err(err.into())))
+            },
+            Ok(r) => r,
+        };
+
+        // At this point, we need to lock the shared state to find out
+        // who to broadcast the message to.
+        let mut inner = this.inner.lock().unwrap();
+        let inner = &mut *inner;
+
+        let mut cached_response_item = None;
+        for instance in inner.instances.values_mut() {
+            // This instance doesn't care; continue. No filter fn means
+            // it will accept anything.
+            if let Some(filter_fn) = &mut instance.filter_fn {
+                if !filter_fn(&response) {
+                    continue
+                }
             }
 
-            // Get a future to receive the next item.
-            let mut fut = this.recv_fut.take().unwrap_or_else(|| {
-                this.recv.receive()
-            });
-
-            // Get the item out of the future, or return if it's not ready yet.
-            let res = match fut.poll_unpin(cx) {
-                Poll::Pending => {
-                    // Put the future back in the guard if it's not ready yet,
-                    // so that we re-use it next time we poll.
-                    this.recv_fut = Some(fut);
-                    return Poll::Pending
+            // Clone cached item if it's there (it's an Arc), or take ownership of
+            // the `Response` and put it in an Arc for cheaper broadcasting.
+            let response_item = match &cached_response_item {
+                None => {
+                    let response_item = Arc::new(response.clone().into_owned());
+                    cached_response_item = Some(response_item.clone());
+                    response_item
                 },
-                Poll::Ready(res) => {
-                    res
-                }
+                Some(res) => res.clone()
             };
 
-            // Get the message out of the result. If a backend error came back, we're done.
-            let msg_bytes = match res {
-                Err(err) => {
-                    // Tell this to stop:
-                    this.done = true;
-                    // Tell streams to stop:
-                    this.inner.lock().unwrap().done = true;
-                    return Poll::Ready(Some(err.into()))
-                },
-                Ok(msg_bytes) => msg_bytes
-            };
+            // Tell the instance about the item it's interested in:
+            instance.queue.push_back(response_item);
+            if let Some(waker) = instance.waker.take() {
+                waker.wake();
+            }
+        }
 
-            // Deserialize the message, borrowing what we can. An error here is recoverable
-            // and won't stop everything.
-            let response = match Response::from_bytes(&msg_bytes) {
-                Err(err) => {
-                    // This error can be ignored but will be handed back.
-                    // The calling code can call the future again to resume.
-                    return Poll::Ready(Some(err.into()))
-                },
-                Ok(r) => r,
-            };
-
-            // At this point, we need to lock the shared state to find out
-            // who to broadcast the message to.
-            let mut inner = this.inner.lock().unwrap();
-            let inner = &mut *inner;
-
-            let mut cached_response_item = None;
-            for instance in inner.instances.values_mut() {
-                // This instance doesn't care; continue. No filter fn means
-                // it will accept anything.
-                if let Some(filter_fn) = &mut instance.filter_fn {
-                    if !filter_fn(&response) {
-                        continue
-                    }
-                }
-
-                // Clone cached item if it's there (it's an Arc), or take ownership of
-                // the `Response` and put it in an Arc for cheaper broadcasting.
-                let response_item = match &cached_response_item {
-                    None => {
-                        let response_item = Arc::new(response.clone().into_owned());
-                        cached_response_item = Some(response_item.clone());
-                        response_item
-                    },
-                    Some(res) => res.clone()
-                };
-
-                // Tell the instance about the item it's interested in:
-                instance.queue.push_back(response_item);
-                if let Some(waker) = instance.waker.take() {
+        // Nothing accepted the message; send it to any "leftover" instances we have.
+        if cached_response_item.is_none() && !inner.leftover_instances.is_empty() {
+            let response_item = Arc::new(response.into_owned());
+            for leftover_instance in inner.leftover_instances.values_mut() {
+                leftover_instance.queue.push_back(response_item.clone());
+                if let Some(waker) = leftover_instance.waker.take() {
                     waker.wake();
                 }
             }
-
-            // Nothing accepted the message; send it to any "leftover" instances we have.
-            if cached_response_item.is_none() && !inner.leftover_instances.is_empty() {
-                let response_item = Arc::new(response.into_owned());
-                for leftover_instance in inner.leftover_instances.values_mut() {
-                    leftover_instance.queue.push_back(response_item.clone());
-                    if let Some(waker) = leftover_instance.waker.take() {
-                        waker.wake();
-                    }
-                }
-            }
         }
+
+        // We've successfully handled a message; allow the caller to react.
+        Poll::Ready(Some(Ok(())))
     }
 }
 
@@ -271,7 +287,7 @@ impl Drop for ResponseStreamMaster {
 }
 
 /// A handle to create [`ResponseStream`]s from.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ResponseStreamHandle {
     inner: Arc<Mutex<ResponseStreamInner>>
 }
@@ -294,8 +310,9 @@ impl ResponseStreamHandle {
 }
 
 /// The type of function used to filter the notification stream.
-pub type FilterFn = Arc<dyn Fn(&Response<'_>) -> bool + Send + 'static>;
+pub type FilterFn = Arc<dyn Fn(&RawResponse<'_>) -> bool + Send + Sync + 'static>;
 
+#[derive(Debug)]
 struct ResponseStreamInner {
     // Don't poll any more; we hit an error so we're done.
     done: bool,
@@ -346,4 +363,13 @@ struct Instance {
     waker: Option<Waker>,
     filter_fn: Option<FilterFn>,
     queue: VecDeque<ResponseStreamItem>
+}
+
+impl std::fmt::Debug for Instance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Instance")
+            .field("waker", &self.waker)
+            .field("filter_fn", &"<function>")
+            .field("queue", &self.queue).finish()
+    }
 }

@@ -13,6 +13,12 @@ pub trait IntoRpcParams {
 /// The RPC params we'll return from our implementations of [`IntoRpcParams`].
 pub type RpcParams = Option<Box<RawValue>>;
 
+impl IntoRpcParams for RpcParams {
+    fn into_rpc_params(self) -> RpcParams {
+        self
+    }
+}
+
 /// Parameter builder to build valid "object or "named" parameters.
 /// This is the equivalent of a JSON Map object `{ key: value }`.
 ///
@@ -40,22 +46,25 @@ impl ObjectParams {
     }
 
     /// Insert a new named parameter.
-    pub fn insert<P: Serialize>(&mut self, name: &str, value: P) -> Result<(), serde_json::Error> {
+    pub fn insert<P: Serialize>(mut self, name: &str, value: P) -> Self {
         if self.bytes.is_empty() {
             self.bytes.push(b'{');
         } else {
             self.bytes.push(b',');
         }
 
-        serde_json::to_writer(&mut self.bytes, name)?;
+        serde_json::to_writer(&mut self.bytes, name)
+            .expect("should always be valid");
         self.bytes.push(b':');
-        serde_json::to_writer(&mut self.bytes, &value)?;
+        serde_json::to_writer(&mut self.bytes, &value)
+            .expect("invalid JSON");
 
-        Ok(())
+        self
     }
+}
 
-    /// Build the final output.
-    pub fn build(mut self) -> RpcParams {
+impl IntoRpcParams for ObjectParams {
+    fn into_rpc_params(mut self) -> RpcParams {
         if self.bytes.is_empty() {
             return None;
         }
@@ -64,12 +73,6 @@ impl ObjectParams {
         // Safety: This is safe because JSON does not emit invalid UTF-8:
         let utf8_string = unsafe { String::from_utf8_unchecked(self.bytes) };
         Some(RawValue::from_string(utf8_string).expect("valid JSON expected"))
-    }
-}
-
-impl IntoRpcParams for ObjectParams {
-    fn into_rpc_params(self) -> RpcParams {
-        self.build()
     }
 }
 
@@ -100,20 +103,22 @@ impl ArrayParams {
     }
 
     /// Insert a new parameter.
-    pub fn insert<P: Serialize>(&mut self, value: P) -> Result<(), serde_json::Error> {
+    pub fn insert<P: Serialize>(mut self, value: P) -> Self {
         if self.bytes.is_empty() {
             self.bytes.push(b'[');
         } else {
             self.bytes.push(b',');
         }
 
-        serde_json::to_writer(&mut self.bytes, &value)?;
+        serde_json::to_writer(&mut self.bytes, &value)
+            .expect("invalid JSON");
 
-        Ok(())
+        self
     }
+}
 
-    /// Build the final output.
-    pub fn build(mut self) -> RpcParams {
+impl IntoRpcParams for ArrayParams {
+    fn into_rpc_params(mut self) -> RpcParams {
         if self.bytes.is_empty() {
             return None;
         }
@@ -125,8 +130,16 @@ impl ArrayParams {
     }
 }
 
-impl IntoRpcParams for ArrayParams {
-    fn into_rpc_params(self) -> RpcParams {
-        self.build()
-    }
+/// Construct positional/array parameters for a JSON-RPC Call.
+#[macro_export]
+macro_rules! params {
+    ($($param:expr),*) => {{
+        let mut a = $crate::params::ArrayParams::new();
+        $(
+            a = a.insert($param);
+        )*
+        a
+    }}
 }
+
+pub use params;
