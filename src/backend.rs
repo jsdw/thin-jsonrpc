@@ -2,8 +2,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Something that can be handed bytes to send out. There is one copy of this
-/// that is not shared, and when our [`crate::Client`] is dropped, this will be too.
+/// Something that can be handed bytes to send out. WHen every copy of the [`crate::Client`]
+/// is dropped, this will be too.
 pub trait BackendSender: Send + Sync + 'static {
     /// Send a message to the JSON-RPC server, emitting an error if something goes wrong.
     /// The message should be serializable to a valid JSON-RPC object.

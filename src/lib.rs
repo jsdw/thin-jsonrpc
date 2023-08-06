@@ -17,13 +17,12 @@ pub mod raw_response;
 use futures_core::Stream;
 use futures_util::StreamExt;
 use response::ErrorObject;
-use response_stream::{ResponseStreamMaster, ResponseStreamHandle};
+use response_stream::{ResponseStreamMaster, ResponseStreamHandle, ResponseStream};
 use raw_response::{RawResponse};
 use backend::{BackendSender, BackendReceiver};
 use params::IntoRpcParams;
 use std::sync::atomic::{ AtomicU64, Ordering };
 use std::sync::Arc;
-use std::pin::Pin;
 use std::task::Poll;
 
 pub use response::{ Response, ResponseError };
@@ -89,8 +88,7 @@ impl Client {
         (client, client_driver)
     }
 
-    /// Make a request to the RPC server. This will return either a response or an error,
-    /// and will attempt to deserialize the response into the type you've asked for.
+    /// Make a request to the RPC server. This will return either a response or an error.
     pub async fn request<Params>(&self, method: &str, params: Params) -> Result<Response, RequestError>
     where Params: IntoRpcParams
     {
@@ -132,7 +130,7 @@ impl Client {
         }
     }
 
-    /// Send a notification to the RPC server. This will not return a result.
+    /// Send a notification to the RPC server. This will not wait for a response.
     pub async fn notification<Params>(&mut self, method: &str, params: Params) -> Result<(), backend::BackendError>
     where Params: IntoRpcParams
     {
@@ -151,14 +149,7 @@ impl Client {
     /// Obtain a stream of server notifications from the backend that aren't linked to
     /// any specific request.
     pub fn server_notifications(&self) -> ServerNotifications {
-        ServerNotifications(Box::pin(self.stream.response_stream().filter_map(move |res| {
-            // Always Ignore responses to requests:
-            if res.id().is_some() {
-                return std::future::ready(None)
-            }
-
-            std::future::ready(Some(Response(res)))
-        })))
+        ServerNotifications(self.stream.response_stream())
     }
 }
 
@@ -187,7 +178,7 @@ impl Stream for ClientDriver {
 /// A struct representing messages from the server. This
 /// implements [`futures_util::Stream`] and provides a couple of
 /// additional helper methods to further filter the stream.
-pub struct ServerNotifications(Pin<Box<dyn Stream<Item=Response> + Send + Sync + 'static>>);
+pub struct ServerNotifications(ResponseStream);
 
 impl ServerNotifications {
     /// This is analogous to [`Response::ok_into()`], but will apply to each
@@ -245,7 +236,24 @@ impl ServerNotifications {
 impl Stream for ServerNotifications {
     type Item = Response;
     fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Option<Self::Item>> {
-        self.0.poll_next_unpin(cx)
+        loop {
+            let Poll::Ready(res) = self.0.poll_next_unpin(cx) else {
+                return Poll::Pending
+            };
+
+            let Some(res) = res else {
+                return Poll::Ready(None)
+            };
+
+            if res.id().is_some() {
+                // If the response has an ID, we filter
+                // it out. Loop and poll again because we
+                // can't return pending if the inner was ready.
+                continue
+            }
+
+            return Poll::Ready(Some(Response(res)))
+        }
     }
 }
 

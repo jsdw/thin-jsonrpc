@@ -259,16 +259,16 @@ fn create_response_stream(
     inner: Arc<Mutex<ResponseStreamInner>>,
 ) -> ResponseStream {
     let mut guard = inner.lock().unwrap();
+
+    // Assign a unique ID.
     let id = guard.next_id;
+    guard.next_id = guard.next_id.wrapping_add(1);
 
     // "register" this copy of the stream to receive messages.
-    guard.next_id += 1;
-
     let instance = Instance {
         queue: VecDeque::new(),
         waker: None
     };
-
     guard.instances.insert(id, instance);
 
     drop(guard);
