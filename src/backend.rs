@@ -90,6 +90,12 @@ pub mod mock {
             self
         }
 
+        /// Send an OK notification back
+        pub fn send_ok_notification<V: serde::Serialize>(&self, value: V) {
+            let res = crate::RawResponse::ok_from_value::<_, u8>(None, value);
+            self.send_response(res)
+        }
+
         /// Send an OK response back
         pub fn send_ok_response<Id: ToString, V: serde::Serialize>(&self, id: Option<Id>, value: V) {
             let res = crate::RawResponse::ok_from_value(id, value);

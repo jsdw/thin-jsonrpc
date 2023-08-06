@@ -89,7 +89,7 @@ impl Client {
     }
 
     /// Make a request to the RPC server. This will return either a response or an error.
-    pub async fn request<Params>(&self, method: &str, params: Params) -> Result<Response, RequestError>
+    pub async fn send_request<Params>(&self, method: &str, params: Params) -> Result<Response, RequestError>
     where Params: IntoRpcParams
     {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
@@ -131,7 +131,7 @@ impl Client {
     }
 
     /// Send a notification to the RPC server. This will not wait for a response.
-    pub async fn notification<Params>(&mut self, method: &str, params: Params) -> Result<(), backend::BackendError>
+    pub async fn send_notification<Params>(&mut self, method: &str, params: Params) -> Result<(), backend::BackendError>
     where Params: IntoRpcParams
     {
         let notification = match params.into_rpc_params() {
@@ -148,7 +148,7 @@ impl Client {
 
     /// Obtain a stream of server notifications from the backend that aren't linked to
     /// any specific request.
-    pub fn server_notifications(&self) -> ServerNotifications {
+    pub fn notifications(&self) -> ServerNotifications {
         ServerNotifications(self.stream.response_stream())
     }
 }
@@ -306,18 +306,18 @@ mod test {
             });
 
         // Check we can decode ok response properly.
-        let res: Vec<u8> = client.request("echo_ok_raw", (1,2,3)).await?.ok_into()?;
+        let res: Vec<u8> = client.send_request("echo_ok_raw", (1,2,3)).await?.ok_into()?;
         assert_eq!(res, vec![1,2,3]);
 
         // Check we can decode error response properly.
-        let err: ErrorObject<Vec<u8>> = client.request("echo_err_raw", (1,2,3)).await?.error_into()?;
+        let err: ErrorObject<Vec<u8>> = client.send_request("echo_err_raw", (1,2,3)).await?.error_into()?;
         assert_eq!(err.code, 123);
         assert_eq!(err.message, "Eep!");
         assert_eq!(err.data, vec![1,2,3]);
 
         // Ensure ID's are incremented and such.
         for i in 0i64..500 {
-            let res: i64 = client.request("add", (i, 1)).await?.ok_into()?;
+            let res: i64 = client.send_request("add", (i, 1)).await?.ok_into()?;
             assert_eq!(res, i + 1);
         }
 
@@ -332,7 +332,7 @@ mod test {
         backend
             .handler("start_sending", |cx, _req| {
                 for i in 0u64..20 {
-                    cx.send_ok_response::<u8,_>(None, i);
+                    cx.send_ok_notification(i);
                 }
                 // If we don't shutdown after, the streams will wait
                 // forever for new messages:
@@ -340,12 +340,12 @@ mod test {
             });
 
         // Subscribe to messages:
-        let twos = client.server_notifications().ok_into_if(|n: &u64| n % 2 == 0);
-        let threes = client.server_notifications().ok_into_if(|res: &u64| res % 3 == 0);
-        let bools = client.server_notifications().ok_into::<bool>();
+        let twos = client.notifications().ok_into_if(|n: &u64| n % 2 == 0);
+        let threes = client.notifications().ok_into_if(|res: &u64| res % 3 == 0);
+        let bools = client.notifications().ok_into::<bool>();
 
         // Start sending notifications.
-        client.notification("start_sending", ()).await?;
+        client.send_notification("start_sending", ()).await?;
 
         // Collect them in our streams to check:
         let twos: Vec<u64> = twos.collect().await;
@@ -360,5 +360,38 @@ mod test {
         assert!(bools.is_empty());
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_lots_of_subscriptions() {
+        let (client, driver, backend) = mock_client();
+        drive_client(driver);
+
+        // lots of listeners:
+        let handles = (0..1000).map(|_| {
+            let mut notifs = client.notifications().ok_into::<u64>();
+            tokio::spawn(async move {
+                let mut n = 0;
+                while let Some(_res) = notifs.next().await {
+                    n += 1;
+                }
+                n
+            })
+        });
+
+        tokio::spawn(async move {
+            for n in 0u64..1000 {
+                backend.send_ok_notification(n);
+            }
+            // Else streams will wait forever:
+            backend.shutdown();
+        });
+
+        let counts: Vec<_> = futures_util::future::join_all(handles).await;
+
+        // Check that every stream saw every message:
+        for count in counts {
+            assert_eq!(count.unwrap(), 1000);
+        }
     }
 }
